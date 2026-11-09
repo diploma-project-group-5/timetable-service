@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [develop, main, "feat/**", "fix/**", "test/**"]
+  pull_request:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      # validator-lib і contracts — git-залежності; lock-файл записує GitHub як ssh, репозиторії
+      # публічні, тож беремо їх через https без ключа.
+      - name: Git-залежності через https
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      # Testcontainers піднімає PostgreSQL 16.15 і Kafka 4.3.2 через Docker раннера.
+      - run: npm test
+      - run: npm run build
+      - name: Docker-образ збирається
+        run: docker build -t timetable-service:ci .
