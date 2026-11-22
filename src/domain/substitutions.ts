@@ -1,23 +1,25 @@
-// Етап 2 · відсутності й заміни (розділи 06, 10). По задачі substitution на кожну дату відсутності;
-// payload самодостатній (contracts: solve.substitution.requested.v1, чернетка): знімок, чинний на дату
-// шаблон (опублікована main або шаблон alert), погоджені заміни тижня.
+// Етап 2 · відсутності й заміни (розділи 06, 10; contracts 0.5.0, ADR 2026-11-15-solver-substitution-engine).
+// По задачі substitution на кожну дату відсутності. Payload самодостатній (solve.substitution.requested.v1):
+// знімок, чинний на дату шаблон (опублікована main або шаблон alert), усі погоджені накладки тижня будь-якого
+// виду, відсутності всіх вчителів тижня й неробочі дати тижня (з ними solver вмикає крок 3).
 //
-// Форма результату заміни в solve.completed у contracts ще не спроєктована. timetable приймає
-// пропозицію (README, «Результат заміни»):
-//   data.substitution = { step: 1..3, proposals: [{ class_id, lesson_no, kind: 'teacher' | 'moved' |
-//     'self_study', teacher_id?, off_profile?, moved_to?: { date, lesson_no } }] }
-// Урок задачі без пропозиції стає «самостійною роботою».
+// solver лише пропонує: результат (data.substitution) перевіряється на інваріант contracts — кожен урок
+// задачі рівно раз, з датою задачі, перенос лише в межах вікна, без рядків поза уроками задачі. Інакше
+// задача failed (invalid_result). Вердикт дає validator-lib: newConflicts(тиждень без пропозицій, тиждень
+// з ними) на знімку задачі — нових конфліктів немає → done, є → rejected. :approve повторює ту саму
+// перевірку на свіжому знімку й поточних накладках.
 import { randomUUID } from 'node:crypto';
-import { dayLoad, type Snapshot } from '@lad/validator-lib';
+import { newConflicts, type Absence, type Snapshot } from '@lad/validator-lib';
 import { writeOutbox } from '../db/events.js';
 import { ensureSchoolState, withSchool, type Db, type SubstitutionKind, type Trx } from '../db/index.js';
 import { fail } from '../problem.js';
-import { addDays, datesBetween, isoWeek, isoWeekday, isSchoolDay, isValidDate, todayKyiv, weekStart } from '../time.js';
+import { addDays, datesBetween, isoWeek, isoWeekday, isValidDate, todayKyiv, weekStart } from '../time.js';
 import { recordAudit, type Ctx, type Deps } from './context.js';
 import { readAlertBells, syncSchoolState } from './jobs.js';
-import { project, type Names } from './projection.js';
-import { loadCalendar, resolveScheduleAt } from './resolve.js';
+import { missingProfileFields, project, type Names } from './projection.js';
+import { loadCalendar, resolveScheduleAt, type Calendar } from './resolve.js';
 import { readData, type TimetableData } from './store.js';
+import { effectiveWeek, type WeekGiven, type WeekOverlay } from './week.js';
 
 export interface SubstitutionInput {
   /** Проєкція знімка, з якою пішла задача. */
@@ -26,6 +28,13 @@ export interface SubstitutionInput {
   absent_teacher_id: string;
   date: string;
   lessons: { class_id: string; lesson_no: number }[];
+  not_before: string;
+  /** Дати, куди можна перенести урок кроком 3: навчальні дні тижня, не раніше not_before, не свята. */
+  window: string[];
+  /** Тиждень на момент запиту (дні тижня): свята, відсутності й погоджені накладки. */
+  holidays: number[];
+  absences: Absence[];
+  overlays: WeekOverlay[];
 }
 
 export interface AbsenceInput {
@@ -38,7 +47,96 @@ export interface AbsenceInput {
 
 const MAX_ABSENCE_DAYS = 31;
 
-/** POST /absences: по задачі substitution на кожну навчальну дату, де вчитель має уроки. Причина не зберігається. */
+type AbsenceRow = { teacher_id: string; date: string; lesson_nos: number[] | null };
+
+interface WeekState {
+  dates: string[];
+  /** Свята тижня, що припадають на навчальні дні (non_school_dates у payload). */
+  holidayDates: string[];
+  /** Відсутності тижня, по рядку на вчителя й дату (null — увесь день). */
+  absences: AbsenceRow[];
+  /** Погоджені накладки тижня, пораховані для цього шаблону, у порядку погодження. */
+  approved: {
+    date: string;
+    class_id: string;
+    lesson_no: number;
+    kind: SubstitutionKind;
+    new_teacher_id: string | null;
+    subject_id: string;
+    moved_to_date: string | null;
+    moved_to_lesson_no: number | null;
+  }[];
+}
+
+/** Стан ISO-тижня дати: свята, відсутності (без скасованих) і погоджені накладки шаблону timetableId. */
+async function loadWeek(trx: Trx, cal: Calendar, input: Snapshot, timetableId: string, date: string): Promise<WeekState> {
+  const from = weekStart(date);
+  const to = addDays(from, 6);
+  const dates = datesBetween(from, to);
+  const schoolDay = (d: string) => input.school_days.includes(isoWeekday(d));
+  const holiday = (d: string) => cal.holidayFrom !== null && cal.holidayTo !== null && cal.holidayFrom <= d && d <= cal.holidayTo;
+  const holidayDates = dates.filter((d) => schoolDay(d) && holiday(d));
+  const teachers = new Set(input.teachers.map((t) => t.id));
+
+  const rows = await trx
+    .selectFrom('absences')
+    .select(['teacher_id', 'date_from', 'date_to', 'lesson_nos'])
+    .where('cancelled_at', 'is', null)
+    .where('date_from', '<=', to)
+    .where('date_to', '>=', from)
+    .execute();
+  const merged = new Map<string, AbsenceRow>();
+  for (const r of rows) {
+    if (!teachers.has(r.teacher_id)) continue;
+    for (const d of datesBetween(r.date_from < from ? from : r.date_from, r.date_to > to ? to : r.date_to)) {
+      if (!schoolDay(d) || holiday(d)) continue;
+      const key = `${r.teacher_id}/${d}`;
+      const prev = merged.get(key);
+      const nos = r.lesson_nos && r.lesson_nos.length > 0 ? r.lesson_nos : null;
+      if (!prev) merged.set(key, { teacher_id: r.teacher_id, date: d, lesson_nos: nos ? [...nos].sort((a, b) => a - b) : null });
+      else if (prev.lesson_nos !== null) prev.lesson_nos = nos === null ? null : [...new Set([...prev.lesson_nos, ...nos])].sort((a, b) => a - b);
+    }
+  }
+  const absences = [...merged.values()].sort((a, b) => a.date.localeCompare(b.date) || a.teacher_id.localeCompare(b.teacher_id));
+
+  const approved = await trx
+    .selectFrom('substitutions')
+    .select(['date', 'class_id', 'lesson_no', 'kind', 'new_teacher_id', 'subject_id', 'moved_to_date', 'moved_to_lesson_no'])
+    .where('state', '=', 'approved')
+    .where('timetable_id', '=', timetableId)
+    .where('date', '>=', from)
+    .where('date', '<=', to)
+    .orderBy('decided_at')
+    .orderBy('date')
+    .orderBy('class_id')
+    .orderBy('lesson_no')
+    .execute();
+  return { dates, holidayDates, absences, approved };
+}
+
+/** Накладка в днях тижня (вхід effectiveWeek). */
+const toOverlay = (o: WeekState['approved'][number]): WeekOverlay => ({
+  day: isoWeekday(o.date),
+  class_id: o.class_id,
+  lesson_no: o.lesson_no,
+  kind: o.kind,
+  ...(o.kind === 'teacher' ? { new_teacher_id: o.new_teacher_id } : {}),
+  ...(o.kind === 'moved' ? { moved_to: { day: isoWeekday(o.moved_to_date!), lesson_no: o.moved_to_lesson_no! } } : {}),
+});
+
+/** Відсутності для validator-lib: дні тижня, «увесь день» — усі номери уроків. */
+const toAbsences = (rows: AbsenceRow[], lessonsPerDay: number): Absence[] =>
+  rows.map((a) => ({
+    teacher_id: a.teacher_id,
+    day: isoWeekday(a.date),
+    lesson_nos: a.lesson_nos ?? Array.from({ length: lessonsPerDay }, (_, i) => i + 1),
+  }));
+
+/**
+ * POST /absences: по задачі substitution на кожну навчальну дату, де вчитель має уроки в тижні з
+ * накладками. Причина не зберігається. Уроки, які вже має погоджена накладка, у задачу не йдуть;
+ * якщо у відсутні години вчитель сам погоджений замісником — 409 teacher_is_substitute.
+ */
 export async function createAbsence(deps: Deps, ctx: Ctx, body: AbsenceInput): Promise<{ absence_id: string; job_ids: string[] }> {
   for (const d of [body.date_from, body.date_to]) if (!isValidDate(d)) fail(422, 'invalid_date', 'Некоректна дата', 'YYYY-MM-DD');
   const now = deps.now();
@@ -57,45 +155,71 @@ export async function createAbsence(deps: Deps, ctx: Ctx, body: AbsenceInput): P
     const cal = await loadCalendar(trx);
     const alertBells = await readAlertBells(trx);
     const absenceId = randomUUID();
-    const dates = datesBetween(body.date_from, body.date_to).filter((d) => isSchoolDay(d, snapshot.profile.saturday));
-    type Planned = { date: string; template: SubstitutionInput['template']; lessons: SubstitutionInput['lessons'] };
+    // Відсутність записується першою: тиждень кожної дати вже бачить її (транзакція відкотиться на 4xx).
+    await trx
+      .insertInto('absences')
+      .values({ school_id: ctx.schoolId, absence_id: absenceId, teacher_id: body.teacher_id, date_from: body.date_from, date_to: body.date_to, lesson_nos: lessonNos })
+      .execute();
+
+    type Planned = { date: string; template: SubstitutionInput['template']; projection: ReturnType<typeof project>; week: WeekState; lessons: SubstitutionInput['lessons'] };
     const planned: Planned[] = [];
     const templates = new Map<string, SubstitutionInput['template']>();
-    for (const date of dates) {
+    const projections = new Map<string, ReturnType<typeof project>>();
+    for (const date of datesBetween(body.date_from, body.date_to)) {
       const r = resolveScheduleAt(cal, date);
       if (r.kind !== 'main' && r.kind !== 'alert') continue;
+      let projection = projections.get(r.kind);
+      if (!projection) {
+        const missing = missingProfileFields(snapshot, r.kind, alertBells);
+        if (missing.length > 0) fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { missing });
+        projection = project(snapshot, r.kind, deps.policy.priorityAreas, alertBells);
+        projections.set(r.kind, projection);
+      }
+      const input = projection.input;
+      if (!input.school_days.includes(isoWeekday(date))) continue;
       let template = templates.get(r.timetable_id);
       if (!template) {
         template = { timetable_id: r.timetable_id, kind: r.kind, ...(await readData(trx, r.timetable_id)) };
         templates.set(r.timetable_id, template);
       }
-      const lessons = template.lessons
-        .filter((l) => l.teacher_id === body.teacher_id && l.day === isoWeekday(date) && (lessonNos === null || lessonNos.includes(l.lesson_no)))
-        .map((l) => ({ class_id: l.class_id, lesson_no: l.lesson_no }));
-      if (lessons.length > 0) planned.push({ date, template, lessons });
+      const week = await loadWeek(trx, cal, input, r.timetable_id, date);
+      const own = week.absences.find((a) => a.teacher_id === body.teacher_id && a.date === date);
+      if (!own) continue;
+      const eff = effectiveWeek(weekGiven(input, template, week)).input;
+      const mine = eff.timetable.lessons.filter(
+        (l) => l.day === isoWeekday(date) && l.teacher_id === body.teacher_id && (own.lesson_nos === null || own.lesson_nos.includes(l.lesson_no)),
+      );
+      const covering = mine.filter((l) => l.origin === 'substitution');
+      if (covering.length > 0) {
+        fail(409, 'teacher_is_substitute', 'Вчитель погоджений замісником', `${date}: уроки ${covering.map((l) => l.lesson_no).join(', ')} — спершу скасуйте ці заміни`, {
+          lessons: covering.map((l) => ({ date, class_id: l.class_id, lesson_no: l.lesson_no })),
+        });
+      }
+      const lessons = mine.map((l) => ({ class_id: l.class_id, lesson_no: l.lesson_no })).sort((a, b) => a.lesson_no - b.lesson_no || a.class_id.localeCompare(b.class_id));
+      if (lessons.length > 0) planned.push({ date, template, projection, week, lessons });
     }
-    if (planned.length === 0) fail(422, 'no_lessons', 'Немає уроків для заміни', 'У цей період вчитель не має уроків в опублікованому розкладі');
+    if (planned.length === 0) fail(422, 'no_lessons', 'Немає уроків для заміни', 'У цей період вчитель не має уроків, які ще не закрито заміною');
 
-    await trx
-      .insertInto('absences')
-      .values({ school_id: ctx.schoolId, absence_id: absenceId, teacher_id: body.teacher_id, date_from: body.date_from, date_to: body.date_to, lesson_nos: lessonNos })
-      .execute();
     const absenceDates = planned.map((p) => p.date);
     const jobIds: string[] = [];
     for (const p of planned) {
       const jobId = randomUUID();
-      const { input, names } = project(snapshot, p.template.kind, deps.policy.priorityAreas, alertBells);
-      const week = weekStart(p.date);
-      const approved = await trx
-        .selectFrom('substitutions')
-        .select(['date', 'class_id', 'lesson_no', 'new_teacher_id', 'subject_id'])
-        .where('state', '=', 'approved')
-        .where('kind', '=', 'teacher')
-        .where('date', '>=', week)
-        .where('date', '<=', addDays(week, 6))
-        .execute();
+      const { input, names } = p.projection;
+      const window = p.week.dates.filter((d) => d >= today && input.school_days.includes(isoWeekday(d)) && !p.week.holidayDates.includes(d));
       const queueDeadline = new Date(now.getTime() + deps.policy.queueAllowanceS * 1000);
-      const jobInput: SubstitutionInput = { snapshot: input, template: p.template, absent_teacher_id: body.teacher_id, date: p.date, lessons: p.lessons };
+      const given = weekGiven(input, p.template, p.week);
+      const jobInput: SubstitutionInput = {
+        snapshot: input,
+        template: p.template,
+        absent_teacher_id: body.teacher_id,
+        date: p.date,
+        lessons: p.lessons,
+        not_before: today,
+        window,
+        holidays: [...(given.holidays ?? [])],
+        absences: [...(given.absences ?? [])],
+        overlays: [...(given.overlays ?? [])],
+      };
       await trx
         .insertInto('jobs')
         .values({
@@ -144,7 +268,18 @@ export async function createAbsence(deps: Deps, ctx: Ctx, body: AbsenceInput): P
           teachers: input.teachers,
           rows: input.rows,
           template: { timetable_id: p.template.timetable_id, kind: p.template.kind, lessons: p.template.lessons, day_formats: p.template.day_formats },
-          approved_substitutions: approved.map((s) => ({ date: s.date, class_id: s.class_id, lesson_no: s.lesson_no, teacher_id: s.new_teacher_id!, subject_id: s.subject_id })),
+          approved_substitutions: p.week.approved.map((s) => ({
+            date: s.date,
+            class_id: s.class_id,
+            lesson_no: s.lesson_no,
+            kind: s.kind,
+            ...(s.kind === 'teacher' ? { teacher_id: s.new_teacher_id! } : {}),
+            ...(s.kind === 'moved' ? { moved_to: { date: s.moved_to_date!, lesson_no: s.moved_to_lesson_no! } } : {}),
+            subject_id: s.subject_id,
+          })),
+          absences: p.week.absences,
+          non_school_dates: p.week.holidayDates,
+          allow_support_moves: false,
         },
       });
       jobIds.push(jobId);
@@ -152,6 +287,18 @@ export async function createAbsence(deps: Deps, ctx: Ctx, body: AbsenceInput): P
     await recordAudit(trx, ctx, 'absence_recorded', body.teacher_id, { absence_id: absenceId, date_from: body.date_from, date_to: body.date_to, jobs: jobIds.length }, now);
     return { absence_id: absenceId, job_ids: jobIds };
   });
+}
+
+function weekGiven(input: Snapshot, template: TimetableData, week: WeekState): WeekGiven {
+  const holidays = week.holidayDates.map(isoWeekday);
+  return {
+    snapshot: input,
+    template,
+    holidays,
+    absences: toAbsences(week.absences, input.lessons_per_day),
+    // Накладки на святах нічого не змінюють (уроків того дня немає).
+    overlays: week.approved.filter((o) => !week.holidayDates.includes(o.date)).map(toOverlay),
+  };
 }
 
 /** GET /absences: поточні й майбутні відсутності та стан їхніх задач. */
@@ -201,50 +348,142 @@ export async function cancelAbsence(deps: Deps, ctx: Ctx, absenceId: string): Pr
   });
 }
 
-const PROPOSAL_KINDS: readonly SubstitutionKind[] = ['teacher', 'moved', 'self_study'];
+type Proposal = {
+  class_id: string;
+  lesson_no: number;
+  kind: 'teacher' | 'moved' | 'self_study';
+  teacher_id: string | null;
+  off_profile: boolean;
+  moved_to: { date: string; lesson_no: number } | null;
+  step: number | null;
+};
 
-/** Зберігає пропозиції solver (solve.completed задачі substitution). Повертає їх для job.result. */
-export async function storeProposals(
+/**
+ * Пропозиції solve.completed за інваріантом contracts 0.5.0 або null, якщо результат зламаний:
+ * кожен урок задачі рівно раз, з датою задачі; moved — у межах вікна (крок 2 — та сама дата);
+ * рядків поза уроками задачі немає (allow_support_moves=false).
+ */
+export function parseProposals(input: SubstitutionInput, data: Record<string, unknown>): Proposal[] | null {
+  const sub = data.substitution as { proposals?: unknown } | undefined;
+  if (!sub || typeof sub !== 'object' || !Array.isArray(sub.proposals)) return null;
+  const raw = sub.proposals as Record<string, unknown>[];
+  if (raw.length !== input.lessons.length) return null;
+  const window = input.window ?? [];
+  const maxNo = input.snapshot.lessons_per_day;
+  const out: Proposal[] = [];
+  for (const l of input.lessons) {
+    const found = raw.filter((p) => p && p.class_id === l.class_id && p.lesson_no === l.lesson_no);
+    if (found.length !== 1) return null;
+    const p = found[0]!;
+    if (p.date !== input.date) return null;
+    const step = typeof p.step === 'number' && Number.isInteger(p.step) ? p.step : null;
+    if (p.kind === 'teacher') {
+      if (typeof p.teacher_id !== 'string' || p.teacher_id.length === 0) return null;
+      out.push({ ...l, kind: 'teacher', teacher_id: p.teacher_id, off_profile: p.off_profile === true, moved_to: null, step });
+    } else if (p.kind === 'moved') {
+      const m = p.moved_to as { date?: unknown; lesson_no?: unknown } | undefined;
+      if (!m || typeof m.date !== 'string' || typeof m.lesson_no !== 'number' || !Number.isInteger(m.lesson_no)) return null;
+      if (m.lesson_no < 1 || m.lesson_no > maxNo) return null;
+      if (m.date !== input.date && !window.includes(m.date)) return null;
+      if (m.date === input.date && m.lesson_no === l.lesson_no) return null;
+      out.push({ ...l, kind: 'moved', teacher_id: null, off_profile: false, moved_to: { date: m.date, lesson_no: m.lesson_no }, step });
+    } else if (p.kind === 'self_study') {
+      out.push({ ...l, kind: 'self_study', teacher_id: null, off_profile: false, moved_to: null, step });
+    } else return null;
+  }
+  return out;
+}
+
+const proposalOverlay = (date: string, p: { class_id: string; lesson_no: number; kind: SubstitutionKind; new_teacher_id: string | null; moved_to: { date: string; lesson_no: number } | null }): WeekOverlay => ({
+  day: isoWeekday(date),
+  class_id: p.class_id,
+  lesson_no: p.lesson_no,
+  kind: p.kind,
+  ...(p.kind === 'teacher' ? { new_teacher_id: p.new_teacher_id } : {}),
+  ...(p.kind === 'moved' ? { moved_to: { day: isoWeekday(p.moved_to!.date), lesson_no: p.moved_to!.lesson_no } } : {}),
+});
+
+type Verdict =
+  | { status: 'invalid'; week: 'baseline' | 'effective'; issues: readonly unknown[] }
+  | { status: 'unapplied' }
+  | { status: 'checked'; added: readonly unknown[] };
+
+/** newConflicts(тиждень без пропозицій, тиждень з ними). */
+function verdict(given: WeekGiven, proposals: WeekOverlay[]): Verdict {
+  const base = effectiveWeek(given);
+  const eff = effectiveWeek({ ...given, overlays: [...(given.overlays ?? []), ...proposals] });
+  if (eff.unapplied.length > base.unapplied.length) return { status: 'unapplied' };
+  const r = newConflicts(base.input, eff.input);
+  if (r.status === 'INVALID_INPUT') return { status: 'invalid', week: r.week, issues: r.issues };
+  return { status: 'checked', added: r.added };
+}
+
+export interface SubstitutionOutcome {
+  state: 'done' | 'rejected' | 'failed';
+  error: string | null;
+  conflicts: unknown[];
+  result: { proposals: ReturnType<typeof subView>[] } | null;
+}
+
+/**
+ * solve.completed задачі substitution: перевірка інваріанту, вердикт validator-lib, збереження пропозицій.
+ * Відхилені validator-lib пропозиції зберігаються як rejected (RQ4); пропозиції задачі, чию відсутність
+ * скасовано до результату, — теж rejected.
+ */
+export async function completeSubstitution(
   trx: Trx,
   job: { school_id: string; job_id: string; input: unknown; absence_id: string | null },
   data: Record<string, unknown>,
-) {
+): Promise<SubstitutionOutcome> {
   const input = job.input as SubstitutionInput;
-  const sub = (data.substitution ?? data) as { step?: unknown; proposals?: unknown };
-  const step = typeof sub.step === 'number' ? sub.step : null;
-  const raw = Array.isArray(sub.proposals) ? (sub.proposals as Record<string, unknown>[]) : [];
+  const proposals = parseProposals(input, data);
+  if (!proposals) return { state: 'failed', error: 'invalid_result', conflicts: [], result: null };
+  const given: WeekGiven = { snapshot: input.snapshot, template: input.template, holidays: input.holidays ?? [], absences: input.absences ?? [], overlays: input.overlays ?? [] };
+  const v = verdict(
+    given,
+    proposals.map((p) => proposalOverlay(input.date, { ...p, new_teacher_id: p.teacher_id })),
+  );
+  if (v.status === 'unapplied') return { state: 'failed', error: 'invalid_result', conflicts: [], result: null };
+  if (v.status === 'invalid') return { state: 'failed', error: v.week === 'baseline' ? 'invalid_snapshot' : 'invalid_result', conflicts: [], result: null };
+  const rejected = v.added.length > 0;
   const cancelled = job.absence_id
     ? (await trx.selectFrom('absences').select('cancelled_at').where('absence_id', '=', job.absence_id).executeTakeFirst())?.cancelled_at
     : null;
+  const subjectOf = (classId: string, no: number) =>
+    input.template.lessons.find((t) => t.class_id === classId && t.day === isoWeekday(input.date) && t.lesson_no === no)?.subject_id ??
+    // Урок, перенесений на цю дату погодженою заміною: предмет — з його вихідного слоту.
+    movedInSubject(input, classId, no);
+  const rows = proposals.map((p) => ({
+    school_id: job.school_id,
+    job_id: job.job_id,
+    date: input.date,
+    class_id: p.class_id,
+    lesson_no: p.lesson_no,
+    timetable_id: input.template.timetable_id,
+    subject_id: subjectOf(p.class_id, p.lesson_no),
+    original_teacher_id: input.absent_teacher_id,
+    kind: p.kind as SubstitutionKind,
+    new_teacher_id: p.teacher_id,
+    off_profile: p.off_profile,
+    moved_to_date: p.moved_to?.date ?? null,
+    moved_to_lesson_no: p.moved_to?.lesson_no ?? null,
+    step: p.step,
+    state: cancelled || rejected ? ('rejected' as const) : ('proposed' as const),
+  }));
+  await trx.insertInto('substitutions').values(rows).onConflict((oc) => oc.doNothing()).execute();
+  return {
+    state: rejected ? 'rejected' : 'done',
+    error: rejected ? 'validator_rejected' : null,
+    conflicts: [...v.added],
+    result: { proposals: rows.map(subView) },
+  };
+}
 
-  const rows = input.lessons.map((l) => {
-    const original = input.template.lessons.find((t) => t.class_id === l.class_id && t.day === isoWeekday(input.date) && t.lesson_no === l.lesson_no);
-    const p = raw.find((x) => x.class_id === l.class_id && x.lesson_no === l.lesson_no);
-    const kind = (p && PROPOSAL_KINDS.includes(p.kind as SubstitutionKind) ? p.kind : 'self_study') as SubstitutionKind;
-    const moved = kind === 'moved' ? (p?.moved_to as { date?: string; lesson_no?: number } | undefined) : undefined;
-    const valid =
-      (kind !== 'teacher' || typeof p?.teacher_id === 'string') && (kind !== 'moved' || (typeof moved?.date === 'string' && typeof moved?.lesson_no === 'number'));
-    const k: SubstitutionKind = valid ? kind : 'self_study';
-    return {
-      school_id: job.school_id,
-      job_id: job.job_id,
-      date: input.date,
-      class_id: l.class_id,
-      lesson_no: l.lesson_no,
-      timetable_id: input.template.timetable_id,
-      subject_id: original?.subject_id ?? input.template.lessons[0]!.subject_id,
-      original_teacher_id: input.absent_teacher_id,
-      kind: k,
-      new_teacher_id: k === 'teacher' ? String(p!.teacher_id) : null,
-      off_profile: k === 'teacher' ? Boolean(p!.off_profile) : false,
-      moved_to_date: k === 'moved' ? moved!.date! : null,
-      moved_to_lesson_no: k === 'moved' ? moved!.lesson_no! : null,
-      step,
-      state: cancelled ? ('rejected' as const) : ('proposed' as const),
-    };
-  });
-  if (rows.length > 0) await trx.insertInto('substitutions').values(rows).onConflict((oc) => oc.doNothing()).execute();
-  return rows.map(subView);
+function movedInSubject(input: SubstitutionInput, classId: string, no: number): string {
+  const day = isoWeekday(input.date);
+  const o = (input.overlays ?? []).find((x) => x.kind === 'moved' && x.class_id === classId && x.moved_to?.day === day && x.moved_to.lesson_no === no);
+  const src = o && input.template.lessons.find((t) => t.class_id === o.class_id && t.day === o.day && t.lesson_no === o.lesson_no);
+  return src?.subject_id ?? input.template.lessons.find((t) => t.class_id === classId)!.subject_id;
 }
 
 const subView = (r: {
@@ -288,10 +527,12 @@ export async function listSubstitutions(db: Db, schoolId: string, date: string) 
 }
 
 /**
- * POST /substitutions/{job_id}:approve. SELECT … FOR UPDATE рядка закладу; на дату має діяти та сама
- * версія, для якої пораховано заміну (інакше 409 stale); перевірка накладок на свіжих даних
- * (вільний слот, недоступні дні, формат дня, тижневий ліміт, місткість); друга погоджена накладка
- * на слот не пройде частковий унікальний індекс. У тілі можна замінити «самостійну роботу» на «скасовано».
+ * POST /substitutions/{job_id}:approve. SELECT … FOR UPDATE рядка закладу; дата не в минулому (409
+ * date_passed); на дату має діяти та сама версія, для якої пораховано заміну (інакше 409 stale).
+ * Вердикт — validator-lib newConflicts на свіжому знімку: тиждень з погодженими накладками й
+ * відсутностями проти того ж тижня з пропозиціями цієї задачі; нові чи гірші конфлікти → 409 conflicts.
+ * Друга погоджена накладка на слот не пройде частковий унікальний індекс. У тілі можна замінити
+ * «самостійну роботу» на «скасовано».
  */
 export async function approveSubstitution(deps: Deps, ctx: Ctx, jobId: string, cancel: { class_id: string; lesson_no: number }[]) {
   const snapshot = await deps.fetchSnapshot(ctx.schoolId, ctx.correlationId);
@@ -304,16 +545,36 @@ export async function approveSubstitution(deps: Deps, ctx: Ctx, jobId: string, c
       const proposals = await trx.selectFrom('substitutions').selectAll().where('job_id', '=', jobId).where('state', '=', 'proposed').execute();
       if (job.state !== 'done' || proposals.length === 0) fail(409, 'job_not_ready', 'Немає пропозицій для погодження');
       const date = job.date!;
+      const today = todayKyiv(deps.now());
+      if (date < today || proposals.some((p) => p.moved_to_date !== null && p.moved_to_date < today)) {
+        fail(409, 'date_passed', 'Дата заміни минула', 'Заміни погоджують на сьогодні або пізніше');
+      }
       const cal = await loadCalendar(trx);
       const r = resolveScheduleAt(cal, date);
       if ((r.kind !== 'main' && r.kind !== 'alert') || r.timetable_id !== proposals[0]!.timetable_id) {
-        fail(409, 'stale', 'На дату діє інший розклад', 'Внесіть відсутність знову');
+        return fail(409, 'stale', 'На дату діє інший розклад', 'Внесіть відсутність знову');
       }
       for (const p of proposals) {
         if (p.kind === 'self_study' && cancel.some((c) => c.class_id === p.class_id && c.lesson_no === p.lesson_no)) p.kind = 'cancelled';
       }
-      const conflicts = await checkOverlays(trx, deps, snapshot, date, r.kind === 'alert' ? 'alert' : 'main', proposals);
-      if (conflicts.length > 0) fail(409, 'conflicts', 'Заміна порушує правила', undefined, { conflicts });
+      const alertBells = r.kind === 'alert' ? await readAlertBells(trx) : [];
+      const missing = missingProfileFields(snapshot, r.kind, alertBells);
+      if (missing.length > 0) fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { missing });
+      const { input } = project(snapshot, r.kind, deps.policy.priorityAreas, alertBells);
+      const template = await readData(trx, r.timetable_id);
+      const week = await loadWeek(trx, cal, input, r.timetable_id, date);
+      const v = verdict(
+        weekGiven(input, template, week),
+        proposals.map((p) =>
+          proposalOverlay(date, { ...p, moved_to: p.moved_to_date ? { date: p.moved_to_date, lesson_no: p.moved_to_lesson_no! } : null }),
+        ),
+      );
+      if (v.status === 'unapplied') fail(409, 'stale', 'Тиждень змінився', 'Урок пропозиції вже не в цьому слоті; внесіть відсутність знову');
+      if (v.status === 'invalid') {
+        if (v.week === 'baseline') fail(500, 'internal', 'Тиждень із накладками не складається', undefined, { issues: v.issues });
+        fail(409, 'stale', 'Пропозиція не застосовується до поточного тижня', 'Внесіть відсутність знову', { issues: v.issues });
+      }
+      if (v.status === 'checked' && v.added.length > 0) fail(409, 'conflicts', 'Заміна порушує правила', undefined, { conflicts: v.added });
       for (const p of proposals) {
         await trx
           .updateTable('substitutions')
@@ -347,102 +608,6 @@ export async function rejectSubstitution(deps: Deps, ctx: Ctx, jobId: string) {
     const rows = await trx.selectFrom('substitutions').selectAll().where('job_id', '=', jobId).execute();
     return rows.map(subView);
   });
-}
-
-type Proposal = {
-  class_id: string;
-  lesson_no: number;
-  kind: SubstitutionKind;
-  new_teacher_id: string | null;
-  moved_to_date: string | null;
-  moved_to_lesson_no: number | null;
-  original_teacher_id: string;
-  timetable_id: string;
-};
-
-/** Перевірка накладок заміни на свіжих даних. Повертає конфлікти у формі contracts/conflict.v1. */
-async function checkOverlays(trx: Trx, deps: Deps, snapshot: Parameters<typeof project>[0], date: string, kind: 'main' | 'alert', proposals: Proposal[]) {
-  const alertBells = kind === 'alert' ? await readAlertBells(trx) : [];
-  const { input } = project(snapshot, kind, deps.policy.priorityAreas, alertBells);
-  const template = await readData(trx, proposals[0]!.timetable_id);
-  const weekday = isoWeekday(date);
-  const week = weekStart(date);
-  const approved = await trx
-    .selectFrom('substitutions')
-    .select(['date', 'class_id', 'lesson_no', 'kind', 'new_teacher_id', 'original_teacher_id', 'moved_to_date', 'moved_to_lesson_no'])
-    .where('state', '=', 'approved')
-    .where('date', '>=', week)
-    .where('date', '<=', addDays(week, 6))
-    .execute();
-  const conflicts: Record<string, unknown>[] = [];
-  const format = (classId: string, day: number) => template.day_formats.find((f) => f.class_id === classId && f.day === day)?.in_person ?? false;
-
-  /** Уроки вчителя на дату з урахуванням погоджених і нових накладок. */
-  const teacherSlots = (teacherId: string, d: string, extra: Proposal[]) => {
-    const wd = isoWeekday(d);
-    const replacedAway = (classId: string, no: number) =>
-      approved.some((a) => a.date === d && a.class_id === classId && a.lesson_no === no) ||
-      extra.some((p) => d === date && p.class_id === classId && p.lesson_no === no);
-    const own = template.lessons.filter((l) => l.teacher_id === teacherId && l.day === wd && !replacedAway(l.class_id, l.lesson_no));
-    const added = [
-      ...approved.filter((a) => a.date === d && a.kind === 'teacher' && a.new_teacher_id === teacherId).map((a) => ({ class_id: a.class_id, lesson_no: a.lesson_no })),
-      ...approved.filter((a) => a.kind === 'moved' && a.moved_to_date === d && a.original_teacher_id === teacherId).map((a) => ({ class_id: a.class_id, lesson_no: a.moved_to_lesson_no! })),
-    ];
-    return [...own.map((l) => ({ class_id: l.class_id, lesson_no: l.lesson_no })), ...added];
-  };
-
-  for (const p of proposals) {
-    if (p.kind === 'teacher') {
-      const t = input.teachers.find((x) => x.id === p.new_teacher_id);
-      if (!t) {
-        conflicts.push({ rule: 'teacher_not_active', teacher_id: p.new_teacher_id });
-        continue;
-      }
-      const others = proposals.filter((x) => x !== p && x.kind === 'teacher' && x.new_teacher_id === t.id);
-      const slots = [...teacherSlots(t.id, date, proposals), ...others.map((o) => ({ class_id: o.class_id, lesson_no: o.lesson_no }))];
-      if (slots.some((s) => s.lesson_no === p.lesson_no)) conflicts.push({ rule: 'teacher_double_booked', teacher_id: t.id, day: weekday, lesson_no: p.lesson_no });
-      if (t.unavailable_days.includes(weekday)) conflicts.push({ rule: 'teacher_unavailable_day', teacher_id: t.id, day: weekday });
-      const fmt = format(p.class_id, weekday);
-      if (slots.some((s) => format(s.class_id, weekday) !== fmt)) conflicts.push({ rule: 'teacher_mixed_format', teacher_id: t.id, day: weekday });
-      const weekly =
-        template.lessons.filter((l) => l.teacher_id === t.id).length +
-        approved.filter((a) => a.kind === 'teacher' && a.new_teacher_id === t.id).length +
-        proposals.filter((x) => x.kind === 'teacher' && x.new_teacher_id === t.id).length;
-      if (weekly > t.weekly_limit) conflicts.push({ rule: 'teacher_weekly_limit', teacher_id: t.id, value: weekly, limit: t.weekly_limit });
-    }
-    if (p.kind === 'moved') {
-      const d = p.moved_to_date!;
-      const no = p.moved_to_lesson_no!;
-      const classBusy = template.lessons.some((l) => l.class_id === p.class_id && l.day === isoWeekday(d) && l.lesson_no === no);
-      if (classBusy) conflicts.push({ rule: 'class_double_booked', class_id: p.class_id, day: isoWeekday(d), lesson_no: no });
-      if (teacherSlots(p.original_teacher_id, d, []).some((s) => s.lesson_no === no)) {
-        conflicts.push({ rule: 'teacher_double_booked', teacher_id: p.original_teacher_id, day: isoWeekday(d), lesson_no: no });
-      }
-    }
-  }
-
-  // Місткість дня: новий очний вчитель додає 1 (розділ 06, крок 1).
-  const dayLessons = template.lessons
-    .filter((l) => l.day === weekday)
-    .map((l) => {
-      const p = proposals.find((x) => x.class_id === l.class_id && x.lesson_no === l.lesson_no);
-      const a = approved.find((x) => x.date === date && x.class_id === l.class_id && x.lesson_no === l.lesson_no);
-      const teacher = p?.kind === 'teacher' ? p.new_teacher_id : a?.kind === 'teacher' ? a.new_teacher_id : p || a ? null : l.teacher_id;
-      return teacher ? { class_id: l.class_id, teacher_id: teacher } : null;
-    })
-    .filter((x): x is { class_id: string; teacher_id: string } => x !== null);
-  const classes = input.classes.map((c) => ({ id: c.id, students: c.students, in_person: format(c.id, weekday) }));
-  const load =
-    kind === 'alert'
-      ? dayLoad({ model: '1.2', staff: input.staff, capacity: input.capacity as { seats: number; passport: number }, day: { classes, lessons: dayLessons } })
-      : dayLoad({ model: '1.1', staff: input.staff, capacity: { passport: input.capacity.passport }, day: { classes, lessons: dayLessons } });
-  if (!load.conditions.passport.ok) {
-    conflicts.push({ rule: 'capacity_exceeded', day: weekday, condition: 'passport', value: load.conditions.passport.load, limit: load.conditions.passport.limit });
-  }
-  if (load.conditions.seats && !load.conditions.seats.ok) {
-    conflicts.push({ rule: 'capacity_exceeded', day: weekday, condition: 'seats', value: load.conditions.seats.load, limit: load.conditions.seats.limit });
-  }
-  return conflicts;
 }
 
 export type { Names };

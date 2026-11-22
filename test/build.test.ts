@@ -1,11 +1,7 @@
 // Побудова (:build), задачі й solve.status, сторож, версії, /load, :publish (409 stale), :copy, PATCH.
-import { readdirSync, readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
-import { Ajv2020 } from 'ajv/dist/2020.js';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { handleSolveStatus, runWatchdog } from '../src/domain/jobs.js';
-import { maintDb, ORDER, PUBLISH_FROM, testApp, uuid, type TestCtx } from './helpers.js';
+import { contractsValidator, maintDb, ORDER, PUBLISH_FROM, testApp, uuid, type TestCtx } from './helpers.js';
 import type { Db } from '../src/db/index.js';
 
 let ctx: TestCtx;
@@ -18,15 +14,6 @@ afterAll(async () => {
   await ctx.close();
   await maint.destroy();
 });
-
-/** Схеми contracts v0.2.0 (devDependency) — щоб подія timetable точно відповідала контракту. */
-function contractsValidator() {
-  const require = createRequire(import.meta.url);
-  const dir = join(dirname(require.resolve('@lad/contracts/package.json')), 'schemas', 'events');
-  const ajv = new Ajv2020({ strict: false, validateFormats: false, allErrors: true });
-  for (const f of readdirSync(dir)) ajv.addSchema(JSON.parse(readFileSync(join(dir, f), 'utf8')));
-  return (id: string) => ajv.getSchema(`https://lad.example/contracts/schemas/events/${id}`)!;
-}
 
 describe(':build', () => {
   test('202 + job_id; solve.build.requested відповідає contracts; без назв і підписів', async () => {

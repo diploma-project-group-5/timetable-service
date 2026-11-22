@@ -25,6 +25,8 @@ export type ProblemCode =
   | 'no_lessons'
   | 'job_not_ready'
   | 'slot_taken'
+  | 'teacher_is_substitute'
+  | 'date_passed'
   | 'school_unavailable'
   | 'internal';
 

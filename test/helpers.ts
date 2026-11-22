@@ -1,6 +1,10 @@
 // Помічники тестів: токени, підробний school-service (знімки в пам'яті), фіксований годинник,
 // заглушка solver (жадібна розстановка) і доступ до outbox.
+import { readdirSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { Writable } from 'node:stream';
+import { Ajv2020 } from 'ajv/dist/2020.js';
 import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair } from 'jose';
 import Fastify from 'fastify';
 import { inject } from 'vitest';
@@ -236,3 +240,17 @@ export type TestCtx = Awaited<ReturnType<typeof testApp>>;
 /** Найближчий навчальний день не раніше ніж через 7 днів від NOW (понеділок 16.11.2026). */
 export const PUBLISH_FROM = '2026-11-16';
 export const ORDER = { order_no: '15-од', order_date: '2026-11-09', approved_by: 'Директор Коваль Н. В.' };
+
+/** Схеми contracts (devDependency, та сама версія, що й validator-lib) — події timetable мають їм відповідати. */
+export function contractsValidator() {
+  const require = createRequire(import.meta.url);
+  const dir = join(dirname(require.resolve('@lad/contracts/package.json')), 'schemas', 'events');
+  const ajv = new Ajv2020({ strict: false, validateFormats: false, allErrors: true });
+  for (const f of readdirSync(dir)) ajv.addSchema(JSON.parse(readFileSync(join(dir, f), 'utf8')));
+  return (id: string) => ajv.getSchema(`https://lad.example/contracts/schemas/events/${id}`)!;
+}
+
+/** Каталог contracts (вектори, приклади). */
+export function contractsDir(): string {
+  return dirname(createRequire(import.meta.url).resolve('@lad/contracts/package.json'));
+}

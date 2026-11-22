@@ -11,7 +11,7 @@ import type { Ctx, Deps } from './context.js';
 import { isTerminal, onCompleted, onStarted, SOLVE_STATUSES, type SolveStatus } from './job-state.js';
 import { missingProfileFields, precheck, project, type Kind, type Names } from './projection.js';
 import { check, conflictsOf, insertVersion, type TimetableData } from './store.js';
-import { storeProposals } from './substitutions.js';
+import { completeSubstitution } from './substitutions.js';
 
 export interface JobView {
   job_id: string;
@@ -277,8 +277,8 @@ async function completeJob(deps: Deps, trx: Trx, e: Envelope, job: JobRow, statu
     return;
   }
   if (job.kind === 'substitution') {
-    const proposals = await storeProposals(trx, job, e.data);
-    await finish(trx, job.job_id, 'done', { result: { proposals }, stats });
+    const o = await completeSubstitution(trx, job, e.data);
+    await finish(trx, job.job_id, o.state, { result: o.result ?? undefined, conflicts: o.conflicts, stats, error: o.error });
     return;
   }
 
