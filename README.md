@@ -71,7 +71,7 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 | `solve.status` | слухає | `solve.started` лише з `queued`; `solve.completed` з будь-якого некінцевого стану; події для кінцевого стану й повтори `event_id` відкидаються. Перевірено на `contracts/vectors/job-lifecycle` |
 | `school.data.changed` | слухає | останній відомий `snapshot_version` (ознака «дані змінилися після побудови»); новий клас чи вчитель — QR; архівований клас чи видалений вчитель — `revoked_at`; видалений вчитель — «Вчитель #N» у копіях версій; зміна дзвінків чи профілю — свіжі дзвінки для сторінок за QR |
 
-Outbox, inbox, relay, консюмер (3 спроби → `<топік>.dlq`) — як у school-service. Сторож (роль `timetable_maint`) раз на хвилину переводить у `failed` задачі в `queued` після `queue_deadline_at` і в `running` після `run_deadline_at = started_at + ліміт + 90 с`.
+Outbox, inbox, relay (частинами до 900 КБ), консюмер (4 спроби з паузами 1, 5, 15 с → `<топік>.dlq`; упалий потік перезапускається з паузою 1 → 30 с, процес не зупиняється) — як у school-service. Сторож (роль `timetable_maint`) раз на хвилину переводить у `failed` задачі в `queued` після `queue_deadline_at` і в `running` після `run_deadline_at = started_at + ліміт + 90 с`.
 
 ### Результат заміни (contracts 0.5.0)
 

@@ -1,8 +1,8 @@
 // Доступ (JWT), консюмер (3 спроби → DLQ), relay, чистка, клієнт знімка school-service.
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import type { Db } from '../src/db/index.js';
-import type { IncomingMessage, OutgoingMessage, Producer } from '../src/kafka/bus.js';
-import { processMessage } from '../src/kafka/consumer.js';
+import type { IncomingMessage, MessageSource, OutgoingMessage, Producer } from '../src/kafka/bus.js';
+import { processMessage, RETRY_DELAYS_MS, superviseConsumer } from '../src/kafka/consumer.js';
 import { chunkBySize, MAX_SEND_BYTES, messageBytes, relayOnce, startRelay } from '../src/kafka/relay.js';
 import { cleanup, scheduleMaintenance } from '../src/maint.js';
 import { createSnapshotFetcher, SchoolUnavailableError } from '../src/school-client.js';
@@ -113,11 +113,48 @@ describe('консюмер', () => {
         backoffMs: () => 1,
       }),
     ).toBe('dlq');
-    expect(calls).toBe(3);
+    expect(calls).toBe(4);
     expect(producer.sent.map((m) => [m.topic, m.headers?.['x-original-offset']])).toEqual([
       ['solve.status.dlq', '7'],
       ['solve.status.dlq', '7'],
     ]);
+  });
+});
+
+describe('консюмер під наглядом', () => {
+  test('superviseConsumer: упалий потік (Kafka недоступна) перезапускається з паузою, процес живе (Z6-2)', async () => {
+    const producer = new MemoryProducer();
+    let made = 0;
+    let closed = 0;
+    const seen: string[] = [];
+    const source = (): MessageSource => {
+      const n = ++made;
+      let release: () => void = () => undefined;
+      const closedSignal = new Promise<void>((r) => (release = r));
+      return {
+        run: async (on) => {
+          if (n <= 2) throw new Error('joinGroup failed');
+          const value = JSON.stringify(ctx.status(uuid(), 'solve.started', { job_id: uuid() }));
+          await on({ topic: 't', partition: 0, offset: '1', key: null, value, commit: async () => { seen.push('commit'); } });
+          await closedSignal; // далі потік чекає нових повідомлень, поки його не закриють
+        },
+        close: async () => {
+          closed++;
+          release();
+        },
+      };
+    };
+    const handle = superviseConsumer(source, { db: ctx.db, producer, handlers: { t: async () => { seen.push('handled'); } }, log: silentLog }, { minDelayMs: 1, maxDelayMs: 5 });
+    for (let i = 0; i < 100 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(made).toBe(3);
+    expect(closed).toBe(2);
+    expect(seen).toEqual(['handled', 'commit']);
+    await handle.stop();
+    expect(closed).toBe(3);
+  });
+
+  test('технічна помилка: 4 спроби з паузами 1, 5, 15 с за замовчуванням (Z6-3)', () => {
+    expect(RETRY_DELAYS_MS).toEqual([1_000, 5_000, 15_000]);
   });
 });
 
