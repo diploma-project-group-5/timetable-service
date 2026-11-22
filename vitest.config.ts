@@ -5,6 +5,9 @@ export default defineConfig({
     include: ['test/**/*.test.ts'],
     // Піднімає PostgreSQL 16.15 (Testcontainers) один раз на весь прогін; Kafka — лише kafka.test.ts.
     globalSetup: ['test/global-setup.ts'],
+    // Файли — послідовно: усі пишуть в outbox однієї бази, а relay бачить outbox усіх закладів, тож
+    // паралельний файл підхоплював (і відправляв) чужі події тесту relay (issue #2, баг 14 з реєстру).
+    fileParallelism: false,
     testTimeout: 30_000,
     hookTimeout: 120_000,
     coverage: {
