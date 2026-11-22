@@ -59,7 +59,7 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 
 Без JWT, токен лише в заголовку `X-Access-Token` (у посиланні він у фрагменті `#`). Токен — `school_id.token_id.MAC`, `MAC = base64url(HMAC-SHA256(secret, school_id ‖ scope ‖ token_id ‖ generation))` (uuid по 16 байт, scope 1 байт, generation int32 BE), порівняння через `crypto.timingSafeEqual`. Невідомий, відкликаний чи підроблений токен — однакова 404 «Посилання недійсне. Зверніться до закладу».
 
-Відповідь — поточний і наступний ISO-тиждень за Europe/Kyiv: `{state, target_label, published_at, upcoming_change, weeks: [{week, days: [{date, format, lessons, holiday?}]}]}`. Сторінка класу показує предмети й позначку заміни, без підписів вчителів; сторінка вчителя — класи, зокрема уроки, де він новий вчитель у погодженій заміні. Ніде немає назви закладу, кількості учнів і місткості. Заголовки: `Cache-Control: no-store`, `X-Robots-Tag: noindex`, `Referrer-Policy: no-referrer`. Rate limit — у шлюзі.
+Відповідь — поточний і наступний ISO-тиждень за Europe/Kyiv: `{state, target_label, published_at, upcoming_change, weeks: [{week, days: [{date, format, lessons, holiday?}]}]}`. `target_label` — з копії назв чинної версії; для класу чи вчителя, доданого після побудови, — з токена (назву оновлює кожен `GET /access-tokens`, міграція `0002`), а `format` днів такого класу — `null`. Сторінка класу показує предмети й позначку заміни, без підписів вчителів; сторінка вчителя — класи, зокрема уроки, де він новий вчитель у погодженій заміні. Ніде немає назви закладу, кількості учнів і місткості. Заголовки: `Cache-Control: no-store`, `X-Robots-Tag: noindex`, `Referrer-Policy: no-referrer`. Rate limit — у шлюзі.
 
 ## Події
 

@@ -3,6 +3,7 @@
 // кодуванням полів: uuid по 16 байт, scope 1 байт (class = 1, teacher = 2), generation int32 BE.
 // Відкритий токен не зберігається, а відтворюється з БД і секрету, тож аркуш можна друкувати знову.
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { sql } from 'kysely';
 import { withSchool, type Db, type Trx } from '../db/index.js';
 import { fail } from '../problem.js';
 import type { SchoolSnapshot } from '../school-client.js';
@@ -46,17 +47,22 @@ export function macMatches(secret: string, schoolId: string, scope: Scope, token
  * вчитель — revoked_at. Ідемпотентно; той самий код застосовує подія school.data.changed.
  */
 export async function syncTokens(trx: Trx, schoolId: string, snapshot: Pick<SchoolSnapshot, 'classes' | 'teachers'>): Promise<void> {
-  const targets: { scope: Scope; id: string; active: boolean }[] = [
-    ...snapshot.classes.map((c) => ({ scope: 'class' as const, id: c.class_id, active: c.archived_at === null })),
-    ...snapshot.teachers.map((t) => ({ scope: 'teacher' as const, id: t.teacher_id, active: t.deleted_at === null })),
+  const targets: { scope: Scope; id: string; label: string; active: boolean }[] = [
+    ...snapshot.classes.map((c) => ({ scope: 'class' as const, id: c.class_id, label: c.name, active: c.archived_at === null })),
+    ...snapshot.teachers.map((t) => ({ scope: 'teacher' as const, id: t.teacher_id, label: t.label, active: t.deleted_at === null })),
   ];
   const active = targets.filter((t) => t.active);
   if (active.length > 0) {
     await trx
       .insertInto('access_tokens')
-      .values(active.map((t) => ({ school_id: schoolId, token_id: randomUUID(), scope: t.scope, target_id: t.id, revoked_at: null })))
+      .values(active.map((t) => ({ school_id: schoolId, token_id: randomUUID(), scope: t.scope, target_id: t.id, revoked_at: null, target_label: t.label })))
       .onConflict((oc) => oc.columns(['school_id', 'scope', 'target_id']).doNothing())
       .execute();
+    // Перейменування класу чи вчителя: запасна назва сторінки за QR теж оновлюється.
+    await sql`
+      update access_tokens t set target_label = v.label
+        from unnest(${active.map((t) => t.scope)}::text[], ${active.map((t) => t.id)}::uuid[], ${active.map((t) => t.label)}::text[]) as v(scope, id, label)
+       where t.scope = v.scope and t.target_id = v.id and t.target_label is distinct from v.label`.execute(trx);
   }
   for (const t of targets.filter((x) => !x.active)) await revokeToken(trx, t.scope, t.id);
 }
@@ -137,7 +143,7 @@ export async function rotateAccessToken(deps: Deps, ctx: Ctx, tokenId: string): 
   });
 }
 
-export type TokenRow = { token_id: string; scope: Scope; target_id: string; generation: number };
+export type TokenRow = { token_id: string; scope: Scope; target_id: string; generation: number; target_label: string | null };
 
 /** Перевірка токена з X-Access-Token під RLS. Будь-яка невдача — null (однакова 404 для всіх випадків). */
 export async function verifyAccess(db: Db, secret: string, raw: string | undefined): Promise<{ schoolId: string; token: TokenRow } | null> {
@@ -146,11 +152,14 @@ export async function verifyAccess(db: Db, secret: string, raw: string | undefin
   const row = await withSchool(db, parsed.schoolId, (trx) =>
     trx
       .selectFrom('access_tokens')
-      .select(['token_id', 'scope', 'target_id', 'generation', 'revoked_at'])
+      .select(['token_id', 'scope', 'target_id', 'generation', 'revoked_at', 'target_label'])
       .where('token_id', '=', parsed.tokenId)
       .executeTakeFirst(),
   );
   if (!row || row.revoked_at !== null) return null;
   if (!macMatches(secret, parsed.schoolId, row.scope, row.token_id, row.generation, parsed.mac)) return null;
-  return { schoolId: parsed.schoolId, token: { token_id: row.token_id, scope: row.scope, target_id: row.target_id, generation: row.generation } };
+  return {
+    schoolId: parsed.schoolId,
+    token: { token_id: row.token_id, scope: row.scope, target_id: row.target_id, generation: row.generation, target_label: row.target_label },
+  };
 }

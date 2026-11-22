@@ -266,7 +266,23 @@ describe('QR і публічна сторінка', () => {
   test('до першої публікації — 200 not_published', async () => {
     const { id } = ctx.newSchool();
     const [cls] = (await ctx.as(id, 'GET', '/access-tokens?type=class')).json();
-    expect((await pub(cls.url.split('#')[1])).json()).toEqual({ state: 'not_published', target_label: '', published_at: null, upcoming_change: null, weeks: [] });
+    expect((await pub(cls.url.split('#')[1])).json()).toEqual({ state: 'not_published', target_label: '5-А', published_at: null, upcoming_change: null, weeks: [] });
+  });
+
+  test('клас, доданий після побудови: назва з токена, формат днів невідомий, а не «дистанційно» (Z5-9)', async () => {
+    const { id, snap } = await published();
+    const classId = uuid();
+    snap.classes.push({ class_id: classId, name: '7-В', students: 20, in_person_priority: false, archived_at: null });
+    snap.snapshot_version = 6;
+    const token = (await ctx.as(id, 'GET', '/access-tokens?type=class')).json().find((t: { target_id: string }) => t.target_id === classId);
+    expect(token.target_label).toBe('7-В');
+    const body = (await pub(token.url.split('#')[1])).json();
+    expect(body).toMatchObject({ state: 'published', target_label: '7-В' });
+    expect(body.weeks[1].days.every((d: { format: unknown; lessons: unknown[] }) => d.format === null && d.lessons.length === 0)).toBe(true);
+    // Перейменування оновлює запасну назву.
+    snap.classes.at(-1)!.name = '7-Г';
+    await ctx.as(id, 'GET', '/access-tokens?type=class');
+    expect((await pub(token.url.split('#')[1])).json().target_label).toBe('7-Г');
   });
 
   test('розклад тривог з дати: шаблон і дзвінки тривог, банер; канікули — день без уроків', async () => {
