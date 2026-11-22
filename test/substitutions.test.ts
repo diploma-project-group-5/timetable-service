@@ -195,6 +195,17 @@ describe('результат solver і вердикт validator-lib', () => {
     }
   });
 
+  test('solver без рушія замін (unsupported_job_type) → GET /jobs: failed з цим кодом, без пропозицій (#2)', async () => {
+    const { id, t1 } = await liveSchool();
+    const jobId = (await absent(id, { teacher_id: t1, date_from: '2026-11-16', date_to: '2026-11-16' })).job_ids[0]!;
+    const example = JSON.parse(readFileSync(join(contractsDir(), 'examples', 'solve.status.v1', 'completed-unsupported-job-type.json'), 'utf8')) as Envelope;
+    const event: Envelope = { ...example, event_id: uuid(), school_id: id, data: { ...example.data, job_id: jobId } };
+    expect(schema('solve.status.v1.json')(event)).toBe(true);
+    expect(await handleSolveStatus(ctx.deps, event)).toBe('processed');
+    expect((await ctx.as(id, 'GET', `/jobs/${jobId}`)).json()).toMatchObject({ state: 'failed', error: 'unsupported_job_type' });
+    expect((await ctx.as(id, 'GET', '/substitutions?date=2026-11-16')).json()).toEqual([]);
+  });
+
   test('пропозиція з новим конфліктом → задача rejected з conflicts, пропозиції rejected', async () => {
     const { id, t1, t4, c1 } = await liveSchool();
     // Коваль (t4) у вівторок на уроці 1 веде 9-Б.
