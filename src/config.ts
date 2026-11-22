@@ -4,6 +4,19 @@
 /** Пріоритетні для очного навчання освітні галузі за рекомендацією МОН (розділ 04). */
 export const DEFAULT_PRIORITY_AREAS = ['math', 'science', 'language_literature', 'civic_history'];
 
+/** Освітні галузі (спека, розділ 04; той самий перелік, що education_area у school-service). */
+export const EDUCATION_AREAS = [
+  'math',
+  'science',
+  'language_literature',
+  'civic_history',
+  'informatics',
+  'arts',
+  'technology',
+  'social_health',
+  'physical',
+] as const;
+
 export interface Policy {
   /** Ліміт часу побудови для solver, с (contracts: solver обрізає до [10, 180]). */
   buildTimeLimitS: number;
@@ -75,6 +88,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
           .split(',')
           .map((s) => s.trim())
           .filter(Boolean);
+  /**
+   * Пріоритетні галузі: незадана змінна — типовий перелік; задана, але порожня, чи з невідомою галуззю —
+   * помилка старту (#3): інакше розрахунок мовчки йшов без жодного пріоритетного предмета.
+   */
+  const areas = (name: string, fallback: string[]): string[] => {
+    const raw = env[name];
+    if (raw === undefined) return fallback;
+    const items = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (items.length === 0) throw new Error(`${name} задано, але порожнє: вкажіть галузі через кому або приберіть змінну (типово ${fallback.join(',')})`);
+    const unknown = items.filter((a) => !(EDUCATION_AREAS as readonly string[]).includes(a));
+    if (unknown.length > 0) throw new Error(`${name}: невідома галузь ${unknown.join(', ')}; допустимі: ${EDUCATION_AREAS.join(', ')}`);
+    return [...new Set(items)];
+  };
 
   const config: Config = {
     host: env.HOST ?? '0.0.0.0',
@@ -101,7 +130,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       publishMinDays: int('PUBLISH_MIN_DAYS', DEFAULT_POLICY.publishMinDays, 0),
       alertThresholdMinutes: int('ALERT_THRESHOLD_MINUTES', DEFAULT_POLICY.alertThresholdMinutes),
       alertThresholdDays: int('ALERT_THRESHOLD_DAYS', DEFAULT_POLICY.alertThresholdDays),
-      priorityAreas: list('PRIORITY_AREAS', DEFAULT_POLICY.priorityAreas),
+      priorityAreas: areas('PRIORITY_AREAS', DEFAULT_POLICY.priorityAreas),
     },
   };
 

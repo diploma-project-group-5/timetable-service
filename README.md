@@ -122,7 +122,7 @@ make migrate
 make dev
 ```
 
-Потрібні `make up` у `platform` і запущений school-service (`SCHOOL_INTERNAL_URL=http://localhost:3102`). Сервіс слухає `:3003`; шлюз веде на нього `/api/v1/timetable/*` і `/api/v1/public/*`.
+Потрібні `make up` у `platform` і запущений school-service (`SCHOOL_INTERNAL_URL=http://localhost:3102`). Сервіс слухає `:3003`; шлюз веде на нього `/api/v1/timetable/*` і `/api/v1/public/*`. Конфігурація перевіряється на старті: наприклад, `PRIORITY_AREAS` (пріоритетні освітні галузі, типово `math,science,language_literature,civic_history`), задана порожньою чи з невідомою галуззю, зупиняє сервіс з назвою змінної й значення.
 
 ## Тести
 

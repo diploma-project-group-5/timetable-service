@@ -143,6 +143,14 @@ describe('конфігурація', () => {
     });
   });
 
+  test('PRIORITY_AREAS: незадана — типові; порожня чи з невідомою галуззю — помилка старту з назвою (#3)', () => {
+    expect(loadConfig(base).policy.priorityAreas).toEqual(['math', 'science', 'language_literature', 'civic_history']);
+    expect(loadConfig({ ...base, PRIORITY_AREAS: ' informatics ,math,math' }).policy.priorityAreas).toEqual(['informatics', 'math']);
+    for (const empty of ['', ' ', ',,']) expect(() => loadConfig({ ...base, PRIORITY_AREAS: empty })).toThrow(/PRIORITY_AREAS задано, але порожнє/);
+    expect(() => loadConfig({ ...base, PRIORITY_AREAS: '[]' })).toThrow(/PRIORITY_AREAS: невідома галузь \[\]/);
+    expect(() => loadConfig({ ...base, PRIORITY_AREAS: 'math,maths' })).toThrow(/невідома галузь maths/);
+  });
+
   test('бракує змінних, короткий секрет, строк черги < 10 хв → помилка', () => {
     expect(() => loadConfig({})).toThrow(/DATABASE_URL.*QR_HMAC_SECRET/);
     expect(() => loadConfig({ ...base, QR_HMAC_SECRET: 'short' })).toThrow(/32/);
