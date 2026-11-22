@@ -250,6 +250,31 @@ describe(':publish', () => {
     }
   });
 
+  test('earliest у 422 — навчальний день: неділя → понеділок; субота — лише для закладу із суботою (#4)', async () => {
+    const at = async (now: string, saturday: boolean) => {
+      ctx.clock.now = new Date('2026-11-09T10:00:00Z');
+      const { id } = ctx.newSchool({ saturday });
+      const { job } = await ctx.build(id);
+      ctx.clock.now = new Date(now);
+      const url = `/timetables/${job.result.timetable_id}:publish`;
+      const res = (await ctx.as(id, 'POST', url, { ...ORDER, effective_from: '2026-11-17' })).json();
+      expect(res).toMatchObject({ code: 'effective_from_too_early' });
+      // Публікація на підказану дату не впирається в not_school_day.
+      expect((await ctx.as(id, 'POST', url, { ...ORDER, effective_from: res.earliest })).statusCode).toBe(200);
+      return res.earliest as string;
+    };
+    try {
+      // Неділя 15.11 (Київ) + 7 днів = неділя 22.11.
+      expect(await at('2026-11-15T10:00:00Z', false)).toBe('2026-11-23');
+      expect(await at('2026-11-15T10:00:00Z', true)).toBe('2026-11-23');
+      // Субота 14.11 + 7 днів = субота 21.11.
+      expect(await at('2026-11-14T10:00:00Z', false)).toBe('2026-11-23');
+      expect(await at('2026-11-14T10:00:00Z', true)).toBe('2026-11-21');
+    } finally {
+      ctx.clock.now = new Date('2026-11-09T10:00:00Z');
+    }
+  });
+
   test('публікація → published, фаза scheduled, audit.recorded, warnings.lost_substitutions = []', async () => {
     const { id } = ctx.newSchool();
     const { job } = await ctx.build(id);
