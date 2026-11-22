@@ -41,6 +41,10 @@ export async function hasCurrentOrFutureActivation(trx: Trx, today: string): Pro
   return row !== undefined;
 }
 
+/** Погоджений план тривог без активації повертається в draft: реквізити наказу знімаються (розділ 03). */
+export const backToDraft = (trx: Trx) =>
+  trx.updateTable('alert_plan').set({ state: 'draft', order_no: null, order_date: null, approved_by: null, updated_at: new Date() }).execute();
+
 export async function readAlertBells(trx: Trx): Promise<BellRow[]> {
   const rows = await trx.selectFrom('alert_bells').selectAll().orderBy('lesson_no').execute();
   return rows.map((r) => ({ lesson_no: r.lesson_no, start: r.starts_at.slice(0, 5), end: r.ends_at.slice(0, 5) }));
@@ -73,6 +77,9 @@ export async function startBuild(deps: Deps, ctx: Ctx, kind: Kind): Promise<{ jo
       if (missing.length > 0) {
         fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { fields: missing });
       }
+      // «Без активації :build повертає план у draft» (розділ 03): інакше результат прийшов би на
+      // погоджений план і задача закрилась би rejected alert_plan_locked (Z1-1).
+      if (kind === 'alert') await backToDraft(trx);
       const { input, names } = project(snapshot, kind, deps.policy.priorityAreas, alertBells);
       const jobId = randomUUID();
       const pre = precheck(input);

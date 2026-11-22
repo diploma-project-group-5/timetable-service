@@ -222,6 +222,12 @@ describe(':publish', () => {
     expect((await ctx.as(id, 'POST', url, { ...ORDER, effective_from: '2026-11-21' })).json()).toMatchObject({ code: 'not_school_day' });
     expect((await ctx.as(id, 'POST', url, { ...ORDER, effective_from: '2026-02-30' })).json()).toMatchObject({ code: 'invalid_date' });
     expect((await ctx.as(id, 'POST', url, { ...ORDER })).statusCode).toBe(400);
+    // Реквізити наказу лише з пробілів — 400, а не 500 від CHECK у БД (Z2-2, Z5-4).
+    for (const blank of [{ order_no: '   ' }, { approved_by: ' \t ' }]) {
+      const res = await ctx.as(id, 'POST', url, { ...ORDER, effective_from: PUBLISH_FROM, ...blank });
+      expect(res.statusCode, JSON.stringify(blank)).toBe(400);
+      expect(res.json()).toMatchObject({ code: 'validation_failed' });
+    }
   });
 
   test('публікація → published, фаза scheduled, audit.recorded, warnings.lost_substitutions = []', async () => {

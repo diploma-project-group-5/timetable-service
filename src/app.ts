@@ -36,10 +36,12 @@ const UUID_RE = new RegExp(UUID);
 const DATE = '^\\d{4}-\\d{2}-\\d{2}$';
 const TIME = '^([01]\\d|2[0-3]):[0-5]\\d$';
 
+// Реквізити наказу зберігаються після trim(): рядок лише з пробілів — 400, а не наказ без номера (Z5-5, Z2-2).
+const NOT_BLANK = '\\S';
 const Order = {
-  order_no: Type.String({ minLength: 1, maxLength: 100 }),
+  order_no: Type.String({ minLength: 1, maxLength: 100, pattern: NOT_BLANK }),
   order_date: Type.String({ pattern: DATE }),
-  approved_by: Type.String({ minLength: 1, maxLength: 200 }),
+  approved_by: Type.String({ minLength: 1, maxLength: 200, pattern: NOT_BLANK }),
 };
 const PublishBody = Type.Object({ ...Order, effective_from: Type.String({ pattern: DATE }) }, { additionalProperties: false });
 const OrderBody = Type.Object(Order, { additionalProperties: false });

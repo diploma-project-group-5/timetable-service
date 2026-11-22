@@ -171,7 +171,7 @@ export async function createAbsence(deps: Deps, ctx: Ctx, body: AbsenceInput): P
       let projection = projections.get(r.kind);
       if (!projection) {
         const missing = missingProfileFields(snapshot, r.kind, alertBells);
-        if (missing.length > 0) fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { missing });
+        if (missing.length > 0) fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { fields: missing });
         projection = project(snapshot, r.kind, deps.policy.priorityAreas, alertBells);
         projections.set(r.kind, projection);
       }
@@ -559,7 +559,7 @@ export async function approveSubstitution(deps: Deps, ctx: Ctx, jobId: string, c
       }
       const alertBells = r.kind === 'alert' ? await readAlertBells(trx) : [];
       const missing = missingProfileFields(snapshot, r.kind, alertBells);
-      if (missing.length > 0) fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { missing });
+      if (missing.length > 0) fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { fields: missing });
       const { input } = project(snapshot, r.kind, deps.policy.priorityAreas, alertBells);
       const template = await readData(trx, r.timetable_id);
       const week = await loadWeek(trx, cal, input, r.timetable_id, date);

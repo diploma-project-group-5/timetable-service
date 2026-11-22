@@ -17,7 +17,7 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 | `GET /timetables` | 200 | версії `kind='main'`: `state`, `effective_from`, обчислена `phase` (`scheduled` · `current` · `archived`), `data_changed_since_build` |
 | `GET /timetables/{id}` | 200 | сітка: `lessons`, `day_formats` (`format`: `in_person` / `remote`), копії `classes`, `teachers`, `subjects`, `order` |
 | `GET /timetables/{id}/load` | 200 | навантаження укриття по днях (значення рахує validator-lib), причина формату кожного класо-дня, підсумок (`peak`, `remote_class_days`, `build_ms`, `classes_without_in_person_days`), `validation`; працює і для шаблону тривог |
-| `POST /timetables/{id}:publish` | 200 · 409 `stale` / `already_published` · 422 | `{order_no, order_date, approved_by, effective_from}`; навчальний день не раніше ніж через 7 днів (Europe/Kyiv); свіжий знімок — якщо `snapshot_version` змінилась, перевірка validator-lib на свіжих даних; одна запланована версія; завжди `warnings.lost_substitutions[]` |
+| `POST /timetables/{id}:publish` | 200 · 409 `stale` / `already_published` · 422 | `{order_no, order_date, approved_by, effective_from}` (номер і «Затвердив» — не з одних пробілів, інакше 400); навчальний день не раніше ніж через 7 днів (Europe/Kyiv); свіжий знімок — якщо `snapshot_version` змінилась, перевірка validator-lib на свіжих даних; одна запланована версія; завжди `warnings.lost_substitutions[]` |
 | `POST /timetables/{id}:copy` | 201 | етап 2 · копія main у `validated` з тим самим `snapshot_version` |
 | `PATCH /timetables/{id}/lessons/{classId}/{day}/{lessonNo}` | 200 · 409 `conflicts` / `published_readonly` | етап 2 · `{day, lesson_no}`; зайнятий слот класу — обмін; синхронна перевірка validator-lib |
 
@@ -26,9 +26,9 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 | Маршрут | Що робить |
 |---|---|
 | `GET /alert-plan` | `{timetable_id, state, bells, order, activations: [{activation_id, from, to}]}`; `to` — дата повернення (не включно) |
-| `POST /alert-plan:build` | побудова за моделлю 1.2 (учні ≤ навчальних місць і всі люди ≤ паспорту; «не в укритті» → дистанційний день); 409 `alert_plan_active`, поки є чинна чи майбутня активація |
+| `POST /alert-plan:build` | побудова за моделлю 1.2 (учні ≤ навчальних місць і всі люди ≤ паспорту; «не в укритті» → дистанційний день); 409 `alert_plan_active`, поки є чинна чи майбутня активація; без активації погоджений план повертається в `draft`; передперевірка «годин більше, ніж дзвінків тривог × дні» — `alert_bells`, як у solver |
 | `GET` `PUT /alert-plan/bells` | дзвінки тривог № 1..N без пропусків; PUT повертає план у draft; 409, поки є чинна чи майбутня активація |
-| `POST /alert-plan:approve` | `{order_no, order_date, approved_by}`; 409 `build_in_progress` / `alert_plan_missing` |
+| `POST /alert-plan:approve` | `{order_no, order_date, approved_by}` (не з одних пробілів, інакше 400); 409 `build_in_progress` / `alert_plan_missing` |
 | `POST /alert-plan:activate` | `{from}` — навчальна дата не раніше сьогодні; 409 `alert_plan_not_approved` / `stale` / `activation_overlap` / `build_in_progress`; `warnings.lost_substitutions[]` |
 | `POST /alert-plan/activations/{id}:end` | `{from}` — дата повернення (пізніша за початок, не раніше сьогодні); ще не чинна активація скасовується; `warnings.lost_substitutions[]` |
 | `GET /alert-hours?from=&to=` | тривалість тривог по днях, `current_streak_days`, `recommendation`, пороги `threshold_minutes`, `threshold_days` |

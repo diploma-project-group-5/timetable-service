@@ -4,7 +4,7 @@ import { ensureSchoolState, withSchool, type BellRow, type Db, type Trx } from '
 import { fail } from '../problem.js';
 import { addDays, isSchoolDay, isValidDate, todayKyiv } from '../time.js';
 import { recordAudit, type Ctx, type Deps } from './context.js';
-import { hasCurrentOrFutureActivation, readAlertBells, syncSchoolState } from './jobs.js';
+import { backToDraft, hasCurrentOrFutureActivation, readAlertBells, syncSchoolState } from './jobs.js';
 import { project } from './projection.js';
 import { approvedSubstitutionsOn } from './resolve.js';
 import { check, conflictsOf, readData } from './store.js';
@@ -33,9 +33,6 @@ async function planIn(trx: Trx): Promise<AlertPlanView> {
 }
 
 export const getAlertPlan = (db: Db, schoolId: string) => withSchool(db, schoolId, planIn);
-
-const backToDraft = (trx: Trx) =>
-  trx.updateTable('alert_plan').set({ state: 'draft', order_no: null, order_date: null, approved_by: null, updated_at: new Date() }).execute();
 
 async function activeBuild(trx: Trx): Promise<boolean> {
   const row = await trx

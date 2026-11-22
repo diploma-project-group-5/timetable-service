@@ -1,8 +1,10 @@
 // Розклад тривог, облік тривог, QR і публічна сторінка, канікули, school.data.changed.
+import { sql } from 'kysely';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { handleSolveStatus } from '../src/domain/jobs.js';
 import { handleSchoolDataChanged } from '../src/domain/misc.js';
 import { encodeToken } from '../src/domain/qr.js';
-import { ORDER, PUBLISH_FROM, QR_SECRET, testApp, uuid, type TestCtx } from './helpers.js';
+import { ORDER, PUBLISH_FROM, QR_SECRET, solve, testApp, uuid, type TestCtx } from './helpers.js';
 
 let ctx: TestCtx;
 beforeAll(async () => {
@@ -37,6 +39,16 @@ describe('розклад тривог', () => {
     const { id } = ctx.newSchool({ shelter_seats: null });
     const res = await ctx.as(id, 'POST', '/alert-plan:build');
     expect(res.json()).toMatchObject({ code: 'profile_incomplete', fields: ['shelter_seats', 'alert_bells'] });
+  });
+
+  test('передперевірка шаблону тривог: годин класу більше, ніж дзвінків тривог × дні → alert_bells, як у solver (Z1-6)', async () => {
+    const { id, snap } = ctx.newSchool();
+    await ctx.as(id, 'PUT', '/alert-plan/bells', [ALERT_BELLS[0]]);
+    const jobId = (await ctx.as(id, 'POST', '/alert-plan:build')).json().job_id;
+    const job = (await ctx.as(id, 'GET', `/jobs/${jobId}`)).json();
+    expect(job.state).toBe('infeasible');
+    expect(job.conflicts).toContainEqual(expect.objectContaining({ rule: 'alert_bells', class_id: snap.classes[0]!.class_id }));
+    expect(job.conflicts.map((c: { rule: string }) => c.rule)).not.toContain('class_hours_exceed_slots');
   });
 
   test('побудова за моделлю 1.2 → шаблон kind=alert у плані draft; «не в укритті» → дистанційний день', async () => {
@@ -99,11 +111,45 @@ describe('розклад тривог', () => {
     expect(res.json().conflicts).toContainEqual(expect.objectContaining({ rule: 'capacity_exceeded', condition: 'seats' }));
   });
 
-  test('результат build_alert, коли план уже погоджено → rejected alert_plan_locked', async () => {
+  test(':build погодженого плану без активації повертає план у draft і дає новий шаблон (Z1-1)', async () => {
     const { id } = await alertReady();
     await ctx.as(id, 'POST', '/alert-plan:approve', ORDER);
-    const { job } = await ctx.build(id, 'alert');
-    expect(job).toMatchObject({ state: 'rejected', error: 'alert_plan_locked' });
+    const res = await ctx.as(id, 'POST', '/alert-plan:build');
+    expect(res.statusCode).toBe(202);
+    expect((await ctx.as(id, 'GET', '/alert-plan')).json()).toMatchObject({ state: 'draft', order: null });
+    const jobId = res.json().job_id;
+    const req = (await ctx.events(id, 'solve.build.requested')).map((e) => e.data).find((d) => d.job_id === jobId)!;
+    await handleSolveStatus(ctx.deps, ctx.status(id, 'solve.completed', { job_id: jobId, status: 'FEASIBLE', ...solve(req as never), conflicts: [] }));
+    expect((await ctx.as(id, 'GET', `/jobs/${jobId}`)).json()).toMatchObject({ state: 'done' });
+    expect((await ctx.as(id, 'POST', '/alert-plan:approve', ORDER)).json()).toMatchObject({ state: 'approved' });
+  });
+
+  test(':approve з номером наказу чи «Затвердив» лише з пробілів → 400, план лишається draft (Z5-5, Z3-12)', async () => {
+    const { id } = await alertReady();
+    for (const blank of [{ order_no: '  ' }, { approved_by: '   ' }]) {
+      const res = await ctx.as(id, 'POST', '/alert-plan:approve', { ...ORDER, ...blank });
+      expect(res.statusCode, JSON.stringify(blank)).toBe(400);
+    }
+    expect((await ctx.as(id, 'GET', '/alert-plan')).json()).toMatchObject({ state: 'draft', order: null });
+    const ok = await ctx.as(id, 'POST', '/alert-plan:approve', { ...ORDER, order_no: '  15-од ' });
+    expect(ok.json()).toMatchObject({ state: 'approved', order: { order_no: '15-од' } });
+  });
+
+  test('результат build_alert, коли план тим часом погоджено → rejected alert_plan_locked', async () => {
+    const { id } = await alertReady();
+    const { jobId } = await (async () => {
+      const r = await ctx.as(id, 'POST', '/alert-plan:build');
+      return { jobId: r.json().job_id as string };
+    })();
+    // Погодження під час побудови API не пропускає (409 build_in_progress); стан, у який результат приходить
+    // на погоджений план, — лише гонка, тож відтворюємо його напряму.
+    await ctx.db.transaction().execute(async (trx) => {
+      await sql`select set_config('app.school_id', ${id}, true)`.execute(trx);
+      await trx.updateTable('alert_plan').set({ state: 'approved', order_no: '1', order_date: '2026-11-09', approved_by: 'Д' }).execute();
+    });
+    const req = (await ctx.events(id, 'solve.build.requested')).map((e) => e.data).find((d) => d.job_id === jobId)!;
+    await handleSolveStatus(ctx.deps, ctx.status(id, 'solve.completed', { job_id: jobId, status: 'FEASIBLE', ...solve(req as never), conflicts: [] }));
+    expect((await ctx.as(id, 'GET', `/jobs/${jobId}`)).json()).toMatchObject({ state: 'rejected', error: 'alert_plan_locked' });
   });
 
   test(':approve без шаблону → 409 alert_plan_missing; під час build_alert → 409 build_in_progress', async () => {
