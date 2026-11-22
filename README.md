@@ -42,7 +42,7 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 |---|---|
 | `POST /absences` | `{teacher_id, date_from, date_to, lesson_nos?}` → 202 `{absence_id, job_ids}`: задача `substitution` на кожну навчальну дату, де вчитель має уроки в тижні з накладками (урок, уже закритий погодженою заміною, не йде); дати активації — від шаблону тривог; причини немає. 409 `teacher_is_substitute` — у відсутні години вчитель сам погоджений замісником; 422 `profile_incomplete` |
 | `GET /absences`, `DELETE /absences/{id}` | поточні й майбутні відсутності зі станом задач; скасування робить пропозиції й погоджені накладки `rejected` |
-| `GET /substitutions?date=` | накладки на дату: `kind` (`teacher` · `moved` · `self_study` · `cancelled`), `new_teacher_id`, `off_profile`, `moved_to`, `step`, `state` |
+| `GET /substitutions?date=` | накладки на дату, зокрема переноси уроків інших дат на цю (`moved_to.date`): `kind` (`teacher` · `moved` · `self_study` · `cancelled`), `new_teacher_id`, `off_profile`, `moved_to`, `step`, `state` |
 | `POST /substitutions/{job_id}:approve` | `{cancel?: [{class_id, lesson_no}]}` — «самостійна робота» → «скасовано»; SELECT … FOR UPDATE закладу; вердикт — `newConflicts` validator-lib на свіжому знімку (тиждень з погодженими накладками проти того ж тижня з пропозиціями задачі); 409 `date_passed` (дата заміни чи переносу минула) / `stale` (на дату діє інша версія або урок уже не в слоті) / `conflicts` (нові чи гірші конфлікти) / `slot_taken`; 422 `profile_incomplete` |
 | `POST /substitutions/{job_id}:reject` | пропозиції → `rejected` (зберігаються для RQ4) |
 | `GET` `PUT /holidays` | `{holiday_from, holiday_to}`: дві дати або обидві `null`; вільного тексту немає |
@@ -77,8 +77,10 @@ Outbox, inbox, relay (частинами до 900 КБ), консюмер (4 с�
 
 `solve.completed` задачі `substitution` несе `data.substitution = {step, proposals[]}` (форма — `contracts/README.md`, «Результат заміни»). timetable:
 
-1. Перевіряє інваріант: кожен урок задачі рівно раз, з датою задачі; `teacher` — з `teacher_id`; `moved` — у межах вікна (крок 2 — та сама дата, крок 3 — навчальний день тижня не раніше `not_before`, не канікули); рядків поза уроками задачі немає. Інакше задача `failed` з `error = invalid_result`, пропозиції не зберігаються.
-2. Збирає тиждень із накладками (`effectiveWeek`, `src/domain/week.ts`; перевірено на всіх `contracts/vectors/substitution` з `given`) і викликає `newConflicts(тиждень без пропозицій, тиждень з ними)` на знімку задачі. Нових чи гірших конфліктів немає — `done`, пропозиції `proposed`; є — `rejected` з `conflicts[]` і `error = validator_rejected`, пропозиції зберігаються як `rejected` (RQ4).
+0. Кожна подія `solve.status` перевіряється схемою `solve.status.v1.json` з `@lad/contracts` (поля новішого MINOR не заважають: `additionalProperties: false` знімається при завантаженні). Подія не за схемою — задача `failed` з `error = invalid_event`.
+1. Вхід перевірки виводиться з того самого `solve.substitution.requested`, що отримав solver (`inputFromRequest`). Перевіряє інваріант: кожен урок задачі рівно раз, з датою задачі; `teacher` — з `teacher_id`; `moved` — у межах вікна (крок 2 — та сама дата, крок 3 — навчальний день тижня не раніше `not_before`, не канікули); рядків поза уроками задачі немає; `substitution.step = max(step)`; пропозиція без `step` бере `substitution.step`. Інакше задача `failed` з `error = invalid_result`, пропозиції не зберігаються.
+2. Збирає тиждень із накладками (`effectiveWeek`, `src/domain/week.ts`; перевірено на всіх `contracts/vectors/substitution` з `given`) і викликає `newConflicts(тиждень без пропозицій, тиждень з ними)` на знімку задачі. Нових чи гірших конфліктів немає — `done`, пропозиції `proposed`; є — `rejected` з `conflicts[]` і `error = validator_rejected`, пропозиції зберігаються як `rejected` (RQ4). Предмет пропозиції — з уроку цього слоту в тижні з накладками.
+3. Тест проганяє всі `contracts/vectors/substitution-solve`: відповідь, яку описує вектор, проходить інваріант і `newConflicts` без нових конфліктів, а зламані варіанти — ні.
 
 ## База даних
 
@@ -102,7 +104,7 @@ Outbox, inbox, relay (частинами до 900 КБ), консюмер (4 с�
 
 ## validator-lib
 
-Git-залежність `…validator-lib.git#v0.4.0` (devDependency `@lad/contracts#v0.5.0`). `validate` перевіряє результат побудови й версії, `dayLoad` рахує `/load`, `newConflicts` дає вердикт задачі заміни й `:approve`. Власних правил перевірки накладок у timetable немає.
+Git-залежності `…validator-lib.git#v0.4.0` і `@lad/contracts#v0.5.0` (схеми для перевірки `solve.status` під час роботи). `validate` перевіряє результат побудови й версії, `dayLoad` рахує `/load`, `newConflicts` дає вердикт задачі заміни й `:approve`. Власних правил перевірки накладок у timetable немає.
 
 ## Розбіжності з припущеннями у `frontend/src/api/types.ts`
 
@@ -135,7 +137,7 @@ Testcontainers піднімає PostgreSQL 16.15 і Kafka 4.3.2 (потрібе�
 | `test/build.test.ts` | `:build` (подія проти схеми contracts, 409, 422, передперевірки, 503), `solve.status`, сторож, `/load`, `:publish` (7 днів, навчальний день, 409 stale, фази, заміна запланованої), `:copy`, PATCH |
 | `test/alert-qr.test.ts` | розклад тривог (модель 1.2, погодження, активації, перетин, `alert_plan_locked`, stale за умовою seats), облік тривог, QR (HMAC, перевипуск, підробки), публічна сторінка (без підписів, тривоги, канікули), `school.data.changed` |
 | `test/substitutions.test.ts` | відсутності (payload проти схеми contracts 0.5.0, накладки й відсутності тижня, канікули, 409 `teacher_is_substitute`), результат solver (інваріант, вердикт validator-lib), погодження (`newConflicts`, 409 `date_passed`), сторінки за QR із замінами, `lost_substitutions`, експорт; події solver — з прикладу contracts і перевіряються схемою |
-| `test/units.test.ts` | машина станів проти `contracts/vectors/job-lifecycle`, `effectiveWeek` проти `contracts/vectors/substitution`, Europe/Kyiv (23:30/00:30, DST), токен QR, конфігурація |
+| `test/units.test.ts` | машина станів проти `contracts/vectors/job-lifecycle`, `effectiveWeek` проти `contracts/vectors/substitution`, вердикт заміни проти `contracts/vectors/substitution-solve`, Europe/Kyiv (23:30/00:30, DST), токен QR, конфігурація |
 | `test/db.test.ts` | RLS, права app/relay/maint, FORCE, `school_id` у ключі, CHECK/EXCLUDE, міграції up/down |
 | `test/infra.test.ts` | доступ, консюмер і DLQ, relay, чистка, клієнт знімка |
 | `test/kafka.test.ts` | справжня Kafka: `solve.build.requested` у топіку, `solve.status` з топіка → `done`, DLQ |

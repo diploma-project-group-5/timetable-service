@@ -179,7 +179,7 @@ describe('результат solver і вердикт validator-lib', () => {
       ['teacher без teacher_id', [{ class_id: c1, lesson_no: 1, kind: 'teacher' }]],
       ['чужа дата', [{ date: '2026-11-17', class_id: c1, lesson_no: 1, kind: 'self_study', step: 2 }]],
       ['рядок поза уроками задачі', [{ class_id: c1, lesson_no: 1, kind: 'self_study', step: 2 }, { class_id: c2, lesson_no: 1, kind: 'teacher', teacher_id: t2 }]],
-      ['урок двічі', [{ class_id: c1, lesson_no: 1, kind: 'self_study', step: 2 }, { class_id: c1, lesson_no: 1, kind: 'teacher', teacher_id: t2 }]],
+      ['урок двічі', [{ class_id: c1, lesson_no: 1, kind: 'self_study', step: 2 }, { class_id: c1, lesson_no: 1, kind: 'teacher', teacher_id: t2, off_profile: false }]],
       ['перенос за межі тижня', [{ class_id: c1, lesson_no: 1, kind: 'moved', moved_to: { date: '2026-11-23', lesson_no: 1 }, step: 3 }]],
       ['перенос у минуле', [{ class_id: c1, lesson_no: 1, kind: 'moved', moved_to: { date: '2026-11-13', lesson_no: 1 }, step: 3 }]],
     ];
@@ -187,7 +187,8 @@ describe('результат solver і вердикт validator-lib', () => {
       const jobId = await job('2026-11-18');
       const raw = name === 'teacher без teacher_id' || name === 'урок двічі';
       const done = await complete(id, jobId, proposals.map((p) => ({ date: '2026-11-18', step: 1, ...p })), { raw });
-      expect(done, name).toMatchObject({ state: 'failed', error: 'invalid_result' });
+      // Пропозиція не за схемою contracts (teacher без teacher_id) ловиться ще перевіркою події (#2).
+      expect(done, name).toMatchObject({ state: 'failed', error: name === 'teacher без teacher_id' ? 'invalid_event' : 'invalid_result' });
       expect((await ctx.as(id, 'GET', '/substitutions?date=2026-11-18')).json(), name).toEqual([]);
       const { absence_id } = (await ctx.as(id, 'GET', '/absences')).json()[0];
       await ctx.as(id, 'DELETE', `/absences/${absence_id}`);
@@ -305,6 +306,8 @@ describe('пропозиції й погодження', () => {
     await complete(id, jobId, [{ class_id: c1, lesson_no: 1, kind: 'moved', moved_to: { date: '2026-11-20', lesson_no: 1 }, step: 3 }]);
     const [p] = (await ctx.as(id, 'GET', '/substitutions?date=2026-11-16')).json();
     expect(p).toMatchObject({ kind: 'moved', moved_to: { date: '2026-11-20', lesson_no: 1 }, step: 3 });
+    // Той самий перенос видно й на дату, куди урок переїжджає (#6, п. 5).
+    expect((await ctx.as(id, 'GET', '/substitutions?date=2026-11-20')).json()).toEqual([expect.objectContaining({ date: '2026-11-16', kind: 'moved', moved_to: { date: '2026-11-20', lesson_no: 1 } })]);
     expect((await ctx.as(id, 'POST', `/substitutions/${jobId}:approve`, {})).statusCode).toBe(200);
     const token = (await ctx.as(id, 'GET', '/access-tokens?type=class')).json().find((t: { target_id: string }) => t.target_id === c1);
     const page = (await ctx.app.inject({ method: 'GET', url: '/api/v1/public/timetable', headers: { 'x-access-token': token.url.split('#')[1] } })).json();

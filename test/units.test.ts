@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { validate } from '@lad/validator-lib';
 import { loadConfig } from '../src/config.js';
+import { inputFromRequest, judgeSubstitution, type SubstitutionRequest } from '../src/domain/substitutions.js';
 import { effectiveWeek, type WeekGiven } from '../src/domain/week.js';
 import { onCompleted, onStarted, watchdogExpires, type SolveStatus } from '../src/domain/job-state.js';
 import { encodeToken, mac, macMatches, parseToken } from '../src/domain/qr.js';
@@ -184,5 +185,99 @@ describe('effectiveWeek ↔ contracts/vectors/substitution', () => {
     expect(input.timetable.lessons).toEqual([{ ...L(2, 1, 'x'), origin: 'substitution' }]);
     expect(input.timetable.not_held).toEqual([{ class_id: 'c', day: 2, lesson_no: 1, subject_id: 's', kind: 'cancelled' }]);
     expect(unapplied).toEqual([{ day: 3, class_id: 'c', lesson_no: 1, kind: 'self_study' }]);
+  });
+});
+
+describe('вердикт заміни ↔ contracts/vectors/substitution-solve', () => {
+  type Expected = {
+    class_id: string;
+    lesson_no: number;
+    kind?: string;
+    kind_in?: string[];
+    teacher_id?: string;
+    teacher_id_in?: string[];
+    off_profile?: boolean;
+    moved_to?: { date: string; lesson_no?: number; lesson_no_in?: number[] };
+    step: number;
+  };
+  const dir = join(dirname(createRequire(import.meta.url).resolve('@lad/contracts/package.json')), 'vectors', 'substitution-solve');
+  const vectors = readdirSync(dir)
+    .filter((f) => f.endsWith('.json'))
+    .map((f) => ({ file: f, ...(JSON.parse(readFileSync(join(dir, f), 'utf8')) as { given: { request: SubstitutionRequest }; expect: { step: number; lessons: Expected[] } }) }));
+
+  /**
+   * Відповідь рушія, яку вектор описує: з допустимих значень — перше, а номери уроків переносів на одну
+   * дату — різні (усі уроки задачі має той самий відсутній вчитель).
+   */
+  const answer = (v: (typeof vectors)[number]) => {
+    const taken = new Set<string>();
+    return {
+      substitution: {
+        step: v.expect.step,
+        proposals: v.expect.lessons.map((e) => {
+          const kind = e.kind ?? e.kind_in![0]!;
+          let movedTo: { date: string; lesson_no: number } | undefined;
+          if (kind === 'moved') {
+            const options = e.moved_to!.lesson_no !== undefined ? [e.moved_to!.lesson_no] : e.moved_to!.lesson_no_in!;
+            const no = options.find((n) => !taken.has(`${e.moved_to!.date}/${n}`)) ?? options[0]!;
+            taken.add(`${e.moved_to!.date}/${no}`);
+            movedTo = { date: e.moved_to!.date, lesson_no: no };
+          }
+          return {
+            date: v.given.request.date,
+            class_id: e.class_id,
+            lesson_no: e.lesson_no,
+            kind,
+            ...(kind === 'teacher' ? { teacher_id: e.teacher_id ?? e.teacher_id_in![0]!, off_profile: e.off_profile ?? false } : {}),
+            ...(movedTo ? { moved_to: movedTo } : {}),
+            step: e.step,
+          };
+        }),
+      },
+    };
+  };
+
+  test('вектори є', () => expect(vectors.length).toBeGreaterThan(20));
+
+  test.each(vectors)('$file: відповідь за вектором проходить інваріант і newConflicts без нових конфліктів', (v) => {
+    const j = judgeSubstitution(inputFromRequest(v.given.request), answer(v));
+    expect(j.status).toBe('checked');
+    if (j.status === 'checked') {
+      expect(j.added).toEqual([]);
+      expect(j.proposals.map((p) => p.step)).toEqual(v.expect.lessons.map((e) => e.step));
+    }
+  });
+
+  test.each(vectors)('$file: без пропозиції на урок, з чужою датою чи замісником-відсутнім — не приймається', (v) => {
+    const input = inputFromRequest(v.given.request);
+    const good = answer(v);
+    const missing = { substitution: { ...good.substitution, proposals: good.substitution.proposals.slice(1) } };
+    expect(judgeSubstitution(input, missing).status).toBe('invalid_result');
+    const otherDate = structuredClone(good);
+    otherDate.substitution.proposals[0]!.date = '2026-11-21';
+    expect(judgeSubstitution(input, otherDate).status).toBe('invalid_result');
+    // Перенос за межі дня (номер уроку понад lessons_per_day) — зламаний результат.
+    const outOfDay = structuredClone(good);
+    outOfDay.substitution.proposals[0] = {
+      date: v.given.request.date,
+      class_id: good.substitution.proposals[0]!.class_id,
+      lesson_no: good.substitution.proposals[0]!.lesson_no,
+      kind: 'moved',
+      moved_to: { date: v.given.request.date, lesson_no: v.given.request.lessons_per_day + 1 },
+      step: 2,
+    } as never;
+    expect(judgeSubstitution(input, outOfDay).status).toBe('invalid_result');
+  });
+
+  test('step пропозиції без власного step — step задачі (#6, п. 6); суперечливий step задачі — зламаний результат', () => {
+    const v = vectors.find((x) => x.file.startsWith('01-'))!;
+    const input = inputFromRequest(v.given.request);
+    const noOwn = answer(v);
+    for (const p of noOwn.substitution.proposals) delete (p as { step?: number }).step;
+    const j = judgeSubstitution(input, noOwn);
+    expect(j.status === 'checked' && j.proposals.every((p) => p.step === v.expect.step)).toBe(true);
+    const wrong = answer(v);
+    wrong.substitution.step = 3;
+    expect(judgeSubstitution(input, wrong).status).toBe('invalid_result');
   });
 });

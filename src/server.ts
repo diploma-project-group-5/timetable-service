@@ -36,6 +36,8 @@ const app = buildApp({
   logger,
 });
 
+deps.log = app.log.child({ component: 'events' });
+
 let producer: Producer | undefined;
 let consumer: ConsumerHandle | undefined;
 let relay: RelayHandle | undefined;
