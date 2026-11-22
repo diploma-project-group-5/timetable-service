@@ -11,7 +11,7 @@ import type { Ctx, Deps } from './context.js';
 import { isTerminal, onCompleted, onStarted, SOLVE_STATUSES, type SolveStatus } from './job-state.js';
 import { missingProfileFields, precheck, project, type Kind, type Names } from './projection.js';
 import { check, conflictsOf, insertVersion, type TimetableData } from './store.js';
-import { storeProposals } from './substitutions.js';
+import { completeSubstitution } from './substitutions.js';
 
 export interface JobView {
   job_id: string;
@@ -40,6 +40,10 @@ export async function hasCurrentOrFutureActivation(trx: Trx, today: string): Pro
     .executeTakeFirst();
   return row !== undefined;
 }
+
+/** Погоджений план тривог без активації повертається в draft: реквізити наказу знімаються (розділ 03). */
+export const backToDraft = (trx: Trx) =>
+  trx.updateTable('alert_plan').set({ state: 'draft', order_no: null, order_date: null, approved_by: null, updated_at: new Date() }).execute();
 
 export async function readAlertBells(trx: Trx): Promise<BellRow[]> {
   const rows = await trx.selectFrom('alert_bells').selectAll().orderBy('lesson_no').execute();
@@ -73,6 +77,9 @@ export async function startBuild(deps: Deps, ctx: Ctx, kind: Kind): Promise<{ jo
       if (missing.length > 0) {
         fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { fields: missing });
       }
+      // «Без активації :build повертає план у draft» (розділ 03): інакше результат прийшов би на
+      // погоджений план і задача закрилась би rejected alert_plan_locked (Z1-1).
+      if (kind === 'alert') await backToDraft(trx);
       const { input, names } = project(snapshot, kind, deps.policy.priorityAreas, alertBells);
       const jobId = randomUUID();
       const pre = precheck(input);
@@ -277,8 +284,8 @@ async function completeJob(deps: Deps, trx: Trx, e: Envelope, job: JobRow, statu
     return;
   }
   if (job.kind === 'substitution') {
-    const proposals = await storeProposals(trx, job, e.data);
-    await finish(trx, job.job_id, 'done', { result: { proposals }, stats });
+    const o = await completeSubstitution(trx, job, e.data);
+    await finish(trx, job.job_id, o.state, { result: o.result ?? undefined, conflicts: o.conflicts, stats, error: o.error });
     return;
   }
 

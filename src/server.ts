@@ -7,10 +7,10 @@ import { createDb } from './db/index.js';
 import type { Deps } from './domain/context.js';
 import { handleSolveStatus } from './domain/jobs.js';
 import { handleSchoolDataChanged } from './domain/misc.js';
-import { runConsumer } from './kafka/consumer.js';
+import { superviseConsumer, type ConsumerHandle } from './kafka/consumer.js';
 import { createProducer, createSource } from './kafka/platformatic.js';
 import { startRelay, type RelayHandle } from './kafka/relay.js';
-import type { MessageSource, Producer } from './kafka/bus.js';
+import type { Producer } from './kafka/bus.js';
 import { scheduleMaintenance } from './maint.js';
 import { createSnapshotFetcher } from './school-client.js';
 
@@ -37,7 +37,7 @@ const app = buildApp({
 });
 
 let producer: Producer | undefined;
-let source: MessageSource | undefined;
+let consumer: ConsumerHandle | undefined;
 let relay: RelayHandle | undefined;
 if (config.kafkaBrokers.length > 0) {
   producer = createProducer({ brokers: config.kafkaBrokers, clientId: config.kafkaClientId });
@@ -46,12 +46,11 @@ if (config.kafkaBrokers.length > 0) {
     'school.data.changed': (_db: unknown, e: Parameters<typeof handleSchoolDataChanged>[1]) => handleSchoolDataChanged(deps, e),
     'solve.status': (_db: unknown, e: Parameters<typeof handleSolveStatus>[1]) => handleSolveStatus(deps, e),
   };
-  source = createSource({ brokers: config.kafkaBrokers, clientId: config.kafkaClientId, groupId: config.kafkaGroupId, topics: Object.keys(handlers) });
-  const consumerLog = app.log.child({ component: 'consumer' });
-  runConsumer(source, { db, producer, handlers, log: consumerLog }).catch((err) => {
-    consumerLog.fatal({ err }, 'консюмер зупинився');
-    process.exit(1);
-  });
+  // Падіння Kafka не зупиняє процес: консюмер перезапускається сам (Z6-2).
+  consumer = superviseConsumer(
+    () => createSource({ brokers: config.kafkaBrokers, clientId: config.kafkaClientId, groupId: config.kafkaGroupId, topics: Object.keys(handlers) }),
+    { db, producer, handlers, log: app.log.child({ component: 'consumer' }) },
+  );
 } else {
   app.log.warn('KAFKA_BROKERS не задано: події не відправляються й не приймаються');
 }
@@ -62,7 +61,7 @@ const shutdown = async (signal: string) => {
   stopMaintenance();
   await app.close();
   await relay?.stop();
-  await source?.close().catch(() => undefined);
+  await consumer?.stop();
   await producer?.close().catch(() => undefined);
   await Promise.allSettled([db.destroy(), relayDb.destroy(), maintDb.destroy()]);
   process.exit(0);

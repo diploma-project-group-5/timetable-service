@@ -93,6 +93,8 @@ export async function publicTimetable(db: Db, schoolId: string, token: TokenRow,
       const any = await trx.selectFrom('timetables').select('names').orderBy('created_at', 'desc').execute();
       targetLabel = any.map((r) => labelFrom(r.names as Names)).find(Boolean);
     }
+    // Клас чи вчителя додали після останньої побудови: назва з токена (Z5-9).
+    if (!targetLabel) targetLabel = token.target_label ?? undefined;
 
     if (cal.mains.length === 0) {
       return { state: 'not_published', target_label: targetLabel ?? '', published_at: null, upcoming_change: null, weeks: [] };
@@ -153,7 +155,8 @@ export async function publicTimetable(db: Db, schoolId: string, token: TokenRow,
         let inPerson: boolean | null = null;
 
         if (token.scope === 'class') {
-          inPerson = v.formats.get(`${token.target_id}:${weekday}`) ?? false;
+          // Класу немає у версії (додано після побудови) — формат невідомий, а не «дистанційно» (Z5-9).
+          inPerson = v.formats.get(`${token.target_id}:${weekday}`) ?? null;
           for (const l of v.lessons.filter((x) => x.class_id === token.target_id && x.day === weekday)) {
             const s = daySubs.find((x) => x.class_id === l.class_id && x.lesson_no === l.lesson_no);
             if (s?.kind === 'cancelled' || s?.kind === 'moved') continue;

@@ -99,8 +99,10 @@ export function precheck(input: Snapshot): ProjectionConflict[] {
     classHours.set(r.class_id, (classHours.get(r.class_id) ?? 0) + r.hours);
     teacherHours.set(r.teacher_id, (teacherHours.get(r.teacher_id) ?? 0) + r.hours);
   }
+  // Для шаблону тривог причина — замало дзвінків тривог: той самий код, що в solver (contracts conflict.v1).
+  const classRule = input.kind === 'alert' ? 'alert_bells' : 'class_hours_exceed_slots';
   for (const [classId, hours] of classHours) {
-    if (hours > slots) conflicts.push({ rule: 'class_hours_exceed_slots', class_id: classId, value: hours, limit: slots });
+    if (hours > slots) conflicts.push({ rule: classRule, class_id: classId, value: hours, limit: slots });
   }
   for (const t of input.teachers) {
     const hours = teacherHours.get(t.id) ?? 0;

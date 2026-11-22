@@ -127,12 +127,12 @@ describe('міграції', () => {
     await admin.query(`CREATE DATABASE ${db} OWNER timetable_owner`);
     const owner = ownerFor(db);
     try {
-      expect(await migrateToLatest(owner)).toEqual(['0001_timetable']);
-      const down = await createMigrator(owner).migrateDown();
-      expect(down.error).toBeUndefined();
+      expect(await migrateToLatest(owner)).toEqual(['0001_timetable', '0002_access_token_labels']);
+      const migrator = createMigrator(owner);
+      for (let i = 0; i < 2; i++) expect((await migrator.migrateDown()).error).toBeUndefined();
       const left = await sql<{ n: number }>`select count(*)::int as n from pg_tables where schemaname = 'public' and tablename not like 'kysely%'`.execute(owner);
       expect(left.rows[0]?.n).toBe(0);
-      expect(await migrateToLatest(owner)).toEqual(['0001_timetable']);
+      expect(await migrateToLatest(owner)).toEqual(['0001_timetable', '0002_access_token_labels']);
     } finally {
       await owner.destroy();
       await admin.query(`DROP DATABASE ${db} WITH (FORCE)`);

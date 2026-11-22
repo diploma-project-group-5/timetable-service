@@ -1,10 +1,12 @@
 // Без бази: машина станів задачі проти contracts/vectors/job-lifecycle, час за Europe/Kyiv,
-// QR-токен (HMAC), проєкція і конфігурація.
+// QR-токен (HMAC), проєкція і конфігурація, effectiveWeek проти contracts/vectors/substitution.
 import { readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { describe, expect, test } from 'vitest';
+import { validate } from '@lad/validator-lib';
 import { loadConfig } from '../src/config.js';
+import { effectiveWeek, type WeekGiven } from '../src/domain/week.js';
 import { onCompleted, onStarted, watchdogExpires, type SolveStatus } from '../src/domain/job-state.js';
 import { encodeToken, mac, macMatches, parseToken } from '../src/domain/qr.js';
 import { addDays, datesBetween, formatUa, isoWeek, isoWeekday, isSchoolDay, isValidDate, todayKyiv, weekStart } from '../src/time.js';
@@ -145,5 +147,42 @@ describe('конфігурація', () => {
     expect(() => loadConfig({ ...base, QR_HMAC_SECRET: 'short' })).toThrow(/32/);
     expect(() => loadConfig({ ...base, QUEUE_ALLOWANCE_S: '60' })).toThrow(/QUEUE_ALLOWANCE_S/);
     expect(() => loadConfig({ ...base, PORT: 'x' })).toThrow(/PORT/);
+  });
+});
+
+describe('effectiveWeek ↔ contracts/vectors/substitution', () => {
+  const dir = join(dirname(createRequire(import.meta.url).resolve('@lad/contracts/package.json')), 'vectors', 'substitution');
+  const vectors = readdirSync(dir)
+    .filter((f) => f.endsWith('.json'))
+    .map((f) => ({ file: f, ...(JSON.parse(readFileSync(join(dir, f), 'utf8')) as { given?: WeekGiven; input: unknown; expected: { status: string; conflicts?: unknown[] } }) }))
+    .filter((v) => v.given !== undefined);
+  test('вектори з given є', () => expect(vectors.length).toBeGreaterThan(20));
+  test.each(vectors)('$file: тиждень як у векторі, вердикт validator-lib як очікується', (v) => {
+    const { input, unapplied } = effectiveWeek(v.given!);
+    expect(unapplied).toEqual([]);
+    expect(JSON.parse(JSON.stringify(input))).toEqual(v.input);
+    const out = validate(input);
+    expect(out.status).toBe(v.expected.status);
+    if (v.expected.conflicts && out.status !== 'INVALID_INPUT') expect(out.conflicts).toEqual(v.expected.conflicts);
+  });
+
+  test('накладка на перенесений у слот урок стосується уроку шаблону; на порожній слот — не застосовується', () => {
+    const snapshot = { kind: 'main', school_days: [1, 2, 3, 4, 5], lessons_per_day: 4, staff: 0, capacity: { passport: 100 }, classes: [], subjects: [], teachers: [], rows: [] } as unknown as WeekGiven['snapshot'];
+    const L = (day: number, no: number, t: string) => ({ class_id: 'c', day, lesson_no: no, subject_id: 's', teacher_id: t });
+    const template = { lessons: [L(1, 1, 'a'), L(2, 1, 'b')], day_formats: [] };
+    const { input, unapplied } = effectiveWeek({
+      snapshot,
+      template,
+      overlays: [
+        { day: 1, class_id: 'c', lesson_no: 1, kind: 'moved', moved_to: { day: 2, lesson_no: 1 } },
+        { day: 2, class_id: 'c', lesson_no: 1, kind: 'cancelled' },
+        { day: 2, class_id: 'c', lesson_no: 1, kind: 'teacher', new_teacher_id: 'x' },
+        { day: 3, class_id: 'c', lesson_no: 1, kind: 'self_study' },
+      ],
+    });
+    // Скасовано урок шаблону вівторка; заміна вчителя — перенесеному з понеділка (інших уроків у слоті вже немає).
+    expect(input.timetable.lessons).toEqual([{ ...L(2, 1, 'x'), origin: 'substitution' }]);
+    expect(input.timetable.not_held).toEqual([{ class_id: 'c', day: 2, lesson_no: 1, subject_id: 's', kind: 'cancelled' }]);
+    expect(unapplied).toEqual([{ day: 3, class_id: 'c', lesson_no: 1, kind: 'self_study' }]);
   });
 });

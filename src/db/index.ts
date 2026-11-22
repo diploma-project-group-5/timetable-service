@@ -162,6 +162,8 @@ export interface AccessTokensTable {
   generation: Generated<number>;
   revoked_at: Date | null;
   created_at: Generated<Date>;
+  /** Назва класу чи підпис вчителя з останнього знімка (0002); null — ще не синхронізовано. */
+  target_label: ColumnType<string | null, string | null | undefined, string | null>;
 }
 
 export interface OutboxTable {

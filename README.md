@@ -6,7 +6,7 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 
 ## API кабінету `/api/v1/timetable/*`
 
-Лише токен клієнта `web` з роллю `scheduler` і `school_id`; заклад — з токена. 401 / 403 / 404 як у school-service. Помилки — `application/problem+json` з `code`, для порушень правил — `conflicts[]` у формі `contracts/schemas/events/conflict.v1.json`. Дії — через двокрапку.
+Лише токен клієнта `web` з роллю `scheduler` і `school_id`; заклад — з токена. 401 / 403 / 404 як у school-service; токен перевіряється до розбору тіла (`onRequest`). `X-Request-Id` (1–128 символів `[A-Za-z0-9._:-]`) стає `correlation_id` подій, інший замінюється uuid. Помилки — `application/problem+json` з `code`, для порушень правил — `conflicts[]` у формі `contracts/schemas/events/conflict.v1.json`. Дії — через двокрапку.
 
 ### Задачі й версії
 
@@ -17,7 +17,7 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 | `GET /timetables` | 200 | версії `kind='main'`: `state`, `effective_from`, обчислена `phase` (`scheduled` · `current` · `archived`), `data_changed_since_build` |
 | `GET /timetables/{id}` | 200 | сітка: `lessons`, `day_formats` (`format`: `in_person` / `remote`), копії `classes`, `teachers`, `subjects`, `order` |
 | `GET /timetables/{id}/load` | 200 | навантаження укриття по днях (значення рахує validator-lib), причина формату кожного класо-дня, підсумок (`peak`, `remote_class_days`, `build_ms`, `classes_without_in_person_days`), `validation`; працює і для шаблону тривог |
-| `POST /timetables/{id}:publish` | 200 · 409 `stale` / `already_published` · 422 | `{order_no, order_date, approved_by, effective_from}`; навчальний день не раніше ніж через 7 днів (Europe/Kyiv); свіжий знімок — якщо `snapshot_version` змінилась, перевірка validator-lib на свіжих даних; одна запланована версія; завжди `warnings.lost_substitutions[]` |
+| `POST /timetables/{id}:publish` | 200 · 409 `stale` / `already_published` · 422 | `{order_no, order_date, approved_by, effective_from}` (номер і «Затвердив» — не з одних пробілів, інакше 400); навчальний день не раніше ніж через 7 днів (Europe/Kyiv); свіжий знімок — якщо `snapshot_version` змінилась, перевірка validator-lib на свіжих даних; одна запланована версія; завжди `warnings.lost_substitutions[]` |
 | `POST /timetables/{id}:copy` | 201 | етап 2 · копія main у `validated` з тим самим `snapshot_version` |
 | `PATCH /timetables/{id}/lessons/{classId}/{day}/{lessonNo}` | 200 · 409 `conflicts` / `published_readonly` | етап 2 · `{day, lesson_no}`; зайнятий слот класу — обмін; синхронна перевірка validator-lib |
 
@@ -26,11 +26,11 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 | Маршрут | Що робить |
 |---|---|
 | `GET /alert-plan` | `{timetable_id, state, bells, order, activations: [{activation_id, from, to}]}`; `to` — дата повернення (не включно) |
-| `POST /alert-plan:build` | побудова за моделлю 1.2 (учні ≤ навчальних місць і всі люди ≤ паспорту; «не в укритті» → дистанційний день); 409 `alert_plan_active`, поки є чинна чи майбутня активація |
+| `POST /alert-plan:build` | побудова за моделлю 1.2 (учні ≤ навчальних місць і всі люди ≤ паспорту; «не в укритті» → дистанційний день); 409 `alert_plan_active`, поки є чинна чи майбутня активація; без активації погоджений план повертається в `draft`; передперевірка «годин більше, ніж дзвінків тривог × дні» — `alert_bells`, як у solver |
 | `GET` `PUT /alert-plan/bells` | дзвінки тривог № 1..N без пропусків; PUT повертає план у draft; 409, поки є чинна чи майбутня активація |
-| `POST /alert-plan:approve` | `{order_no, order_date, approved_by}`; 409 `build_in_progress` / `alert_plan_missing` |
+| `POST /alert-plan:approve` | `{order_no, order_date, approved_by}` (не з одних пробілів, інакше 400); 409 `build_in_progress` / `alert_plan_missing` |
 | `POST /alert-plan:activate` | `{from}` — навчальна дата не раніше сьогодні; 409 `alert_plan_not_approved` / `stale` / `activation_overlap` / `build_in_progress`; `warnings.lost_substitutions[]` |
-| `POST /alert-plan/activations/{id}:end` | `{from}` — дата повернення (пізніша за початок, не раніше сьогодні); ще не чинна активація скасовується; `warnings.lost_substitutions[]` |
+| `POST /alert-plan/activations/{id}:end` | `{from}` — дата повернення (пізніша за початок, не раніше сьогодні, інакше 422) і для активації, що ще не почалась; повтор з тією ж датою — та сама відповідь без нового запису в журналі; завершена — 409 `activation_ended`; `warnings.lost_substitutions[]` |
 | `GET /alert-hours?from=&to=` | тривалість тривог по днях, `current_streak_days`, `recommendation`, пороги `threshold_minutes`, `threshold_days` |
 | `PUT /alert-hours/{date}` | `{minutes}` (0–1440) за минулий день або сьогодні |
 
@@ -40,10 +40,10 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 
 | Маршрут | Що робить |
 |---|---|
-| `POST /absences` | `{teacher_id, date_from, date_to, lesson_nos?}` → 202 `{absence_id, job_ids}`: задача `substitution` на кожну навчальну дату з уроками; дати активації — від шаблону тривог; причини немає |
+| `POST /absences` | `{teacher_id, date_from, date_to, lesson_nos?}` → 202 `{absence_id, job_ids}`: задача `substitution` на кожну навчальну дату, де вчитель має уроки в тижні з накладками (урок, уже закритий погодженою заміною, не йде); дати активації — від шаблону тривог; причини немає. 409 `teacher_is_substitute` — у відсутні години вчитель сам погоджений замісником; 422 `profile_incomplete` |
 | `GET /absences`, `DELETE /absences/{id}` | поточні й майбутні відсутності зі станом задач; скасування робить пропозиції й погоджені накладки `rejected` |
 | `GET /substitutions?date=` | накладки на дату: `kind` (`teacher` · `moved` · `self_study` · `cancelled`), `new_teacher_id`, `off_profile`, `moved_to`, `step`, `state` |
-| `POST /substitutions/{job_id}:approve` | `{cancel?: [{class_id, lesson_no}]}` — «самостійна робота» → «скасовано»; SELECT … FOR UPDATE закладу; 409 `stale` (на дату діє інша версія) / `conflicts` / `slot_taken` |
+| `POST /substitutions/{job_id}:approve` | `{cancel?: [{class_id, lesson_no}]}` — «самостійна робота» → «скасовано»; SELECT … FOR UPDATE закладу; вердикт — `newConflicts` validator-lib на свіжому знімку (тиждень з погодженими накладками проти того ж тижня з пропозиціями задачі); 409 `date_passed` (дата заміни чи переносу минула) / `stale` (на дату діє інша версія або урок уже не в слоті) / `conflicts` (нові чи гірші конфлікти) / `slot_taken`; 422 `profile_incomplete` |
 | `POST /substitutions/{job_id}:reject` | пропозиції → `rejected` (зберігаються для RQ4) |
 | `GET` `PUT /holidays` | `{holiday_from, holiday_to}`: дві дати або обидві `null`; вільного тексту немає |
 | `GET /teachers/{id}/export` | частина експорту (ст. 8): уроки у версіях, відсутності, заміни |
@@ -59,36 +59,26 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 
 Без JWT, токен лише в заголовку `X-Access-Token` (у посиланні він у фрагменті `#`). Токен — `school_id.token_id.MAC`, `MAC = base64url(HMAC-SHA256(secret, school_id ‖ scope ‖ token_id ‖ generation))` (uuid по 16 байт, scope 1 байт, generation int32 BE), порівняння через `crypto.timingSafeEqual`. Невідомий, відкликаний чи підроблений токен — однакова 404 «Посилання недійсне. Зверніться до закладу».
 
-Відповідь — поточний і наступний ISO-тиждень за Europe/Kyiv: `{state, target_label, published_at, upcoming_change, weeks: [{week, days: [{date, format, lessons, holiday?}]}]}`. Сторінка класу показує предмети й позначку заміни, без підписів вчителів; сторінка вчителя — класи, зокрема уроки, де він новий вчитель у погодженій заміні. Ніде немає назви закладу, кількості учнів і місткості. Заголовки: `Cache-Control: no-store`, `X-Robots-Tag: noindex`, `Referrer-Policy: no-referrer`. Rate limit — у шлюзі.
+Відповідь — поточний і наступний ISO-тиждень за Europe/Kyiv: `{state, target_label, published_at, upcoming_change, weeks: [{week, days: [{date, format, lessons, holiday?}]}]}`. `target_label` — з копії назв чинної версії; для класу чи вчителя, доданого після побудови, — з токена (назву оновлює кожен `GET /access-tokens`, міграція `0002`), а `format` днів такого класу — `null`. Сторінка класу показує предмети й позначку заміни, без підписів вчителів; сторінка вчителя — класи, зокрема уроки, де він новий вчитель у погодженій заміні. Ніде немає назви закладу, кількості учнів і місткості. Заголовки: `Cache-Control: no-store`, `X-Robots-Tag: noindex`, `Referrer-Policy: no-referrer`. Rate limit — у шлюзі.
 
 ## Події
 
 | Топік | Напрям | Що |
 |---|---|---|
 | `solve.build.requested` | публікує | `contracts/schemas/events/solve.build.requested.v1.json` (тест перевіряє подію схемою); лише id, без назв і підписів |
-| `solve.substitution.requested` | публікує | чернетка contracts для етапу 2 |
+| `solve.substitution.requested` | публікує | `contracts` 0.5.0 (тест перевіряє подію схемою): знімок, шаблон, `approved_substitutions` тижня будь-якого `kind`, `absences` усіх вчителів тижня (по рядку на вчителя й дату), `non_school_dates` (канікули тижня, `[]` — немає; з полем solver вмикає крок 3), `allow_support_moves: false` |
 | `audit.recorded` | публікує | `{at, actor, action, target, details}` — публікація, погодження/активація/повернення розкладу тривог, відсутності й заміни, перевипуск QR, канікули, експорт |
 | `solve.status` | слухає | `solve.started` лише з `queued`; `solve.completed` з будь-якого некінцевого стану; події для кінцевого стану й повтори `event_id` відкидаються. Перевірено на `contracts/vectors/job-lifecycle` |
 | `school.data.changed` | слухає | останній відомий `snapshot_version` (ознака «дані змінилися після побудови»); новий клас чи вчитель — QR; архівований клас чи видалений вчитель — `revoked_at`; видалений вчитель — «Вчитель #N» у копіях версій; зміна дзвінків чи профілю — свіжі дзвінки для сторінок за QR |
 
-Outbox, inbox, relay, консюмер (3 спроби → `<топік>.dlq`) — як у school-service. Сторож (роль `timetable_maint`) раз на хвилину переводить у `failed` задачі в `queued` після `queue_deadline_at` і в `running` після `run_deadline_at = started_at + ліміт + 90 с`.
+Outbox, inbox, relay (частинами до 900 КБ), консюмер (4 спроби з паузами 1, 5, 15 с → `<топік>.dlq`; упалий потік перезапускається з паузою 1 → 30 с, процес не зупиняється) — як у school-service. Сторож (роль `timetable_maint`) раз на хвилину переводить у `failed` задачі в `queued` після `queue_deadline_at` і в `running` після `run_deadline_at = started_at + ліміт + 90 с`.
 
-### Результат заміни — пропозиція для contracts
+### Результат заміни (contracts 0.5.0)
 
-Форма результату заміни в `solve.completed` у contracts ще не спроєктована («still to be designed»). timetable приймає:
+`solve.completed` задачі `substitution` несе `data.substitution = {step, proposals[]}` (форма — `contracts/README.md`, «Результат заміни»). timetable:
 
-```json
-"substitution": {
-  "step": 1,
-  "proposals": [
-    { "class_id": "…", "lesson_no": 1, "kind": "teacher", "teacher_id": "…", "off_profile": true },
-    { "class_id": "…", "lesson_no": 2, "kind": "moved", "moved_to": { "date": "2026-11-20", "lesson_no": 3 } },
-    { "class_id": "…", "lesson_no": 3, "kind": "self_study" }
-  ]
-}
-```
-
-Урок задачі без пропозиції стає `self_study`. Узгодити з власником solver і внести в contracts як MINOR.
+1. Перевіряє інваріант: кожен урок задачі рівно раз, з датою задачі; `teacher` — з `teacher_id`; `moved` — у межах вікна (крок 2 — та сама дата, крок 3 — навчальний день тижня не раніше `not_before`, не канікули); рядків поза уроками задачі немає. Інакше задача `failed` з `error = invalid_result`, пропозиції не зберігаються.
+2. Збирає тиждень із накладками (`effectiveWeek`, `src/domain/week.ts`; перевірено на всіх `contracts/vectors/substitution` з `given`) і викликає `newConflicts(тиждень без пропозицій, тиждень з ними)` на знімку задачі. Нових чи гірших конфліктів немає — `done`, пропозиції `proposed`; є — `rejected` з `conflicts[]` і `error = validator_rejected`, пропозиції зберігаються як `rejected` (RQ4).
 
 ## База даних
 
@@ -112,7 +102,7 @@ Outbox, inbox, relay, консюмер (3 спроби → `<топік>.dlq`) �
 
 ## validator-lib
 
-Підключено git-залежністю на коміт гілки `fix/git-install-prepare` (у бібліотеці додано `prepare`, щоб npm збирав `dist/` при встановленні з git). Після мерджу й тегу — замінити на `…validator-lib.git#v0.1.0`. Режиму перевірки окремої накладки заміни у validator-lib поки немає: на `:approve` timetable перевіряє вільний слот, недоступні дні, формат дня, тижневий ліміт і місткість (`dayLoad` з validator-lib) сам.
+Git-залежність `…validator-lib.git#v0.4.0` (devDependency `@lad/contracts#v0.5.0`). `validate` перевіряє результат побудови й версії, `dayLoad` рахує `/load`, `newConflicts` дає вердикт задачі заміни й `:approve`. Власних правил перевірки накладок у timetable немає.
 
 ## Розбіжності з припущеннями у `frontend/src/api/types.ts`
 
@@ -144,8 +134,8 @@ Testcontainers піднімає PostgreSQL 16.15 і Kafka 4.3.2 (потрібе�
 |---|---|
 | `test/build.test.ts` | `:build` (подія проти схеми contracts, 409, 422, передперевірки, 503), `solve.status`, сторож, `/load`, `:publish` (7 днів, навчальний день, 409 stale, фази, заміна запланованої), `:copy`, PATCH |
 | `test/alert-qr.test.ts` | розклад тривог (модель 1.2, погодження, активації, перетин, `alert_plan_locked`, stale за умовою seats), облік тривог, QR (HMAC, перевипуск, підробки), публічна сторінка (без підписів, тривоги, канікули), `school.data.changed` |
-| `test/substitutions.test.ts` | відсутності, пропозиції, погодження з перевіркою накладок, сторінки за QR із замінами, `lost_substitutions`, експорт |
-| `test/units.test.ts` | машина станів проти `contracts/vectors/job-lifecycle`, Europe/Kyiv (23:30/00:30, DST), токен QR, конфігурація |
+| `test/substitutions.test.ts` | відсутності (payload проти схеми contracts 0.5.0, накладки й відсутності тижня, канікули, 409 `teacher_is_substitute`), результат solver (інваріант, вердикт validator-lib), погодження (`newConflicts`, 409 `date_passed`), сторінки за QR із замінами, `lost_substitutions`, експорт; події solver — з прикладу contracts і перевіряються схемою |
+| `test/units.test.ts` | машина станів проти `contracts/vectors/job-lifecycle`, `effectiveWeek` проти `contracts/vectors/substitution`, Europe/Kyiv (23:30/00:30, DST), токен QR, конфігурація |
 | `test/db.test.ts` | RLS, права app/relay/maint, FORCE, `school_id` у ключі, CHECK/EXCLUDE, міграції up/down |
 | `test/infra.test.ts` | доступ, консюмер і DLQ, relay, чистка, клієнт знімка |
 | `test/kafka.test.ts` | справжня Kafka: `solve.build.requested` у топіку, `solve.status` з топіка → `done`, DLQ |

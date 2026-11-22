@@ -1,9 +1,10 @@
 // Доступ (JWT), консюмер (3 спроби → DLQ), relay, чистка, клієнт знімка school-service.
-import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { generateKeyPair } from 'jose';
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import type { Db } from '../src/db/index.js';
-import type { IncomingMessage, OutgoingMessage, Producer } from '../src/kafka/bus.js';
-import { processMessage } from '../src/kafka/consumer.js';
-import { relayOnce, startRelay } from '../src/kafka/relay.js';
+import type { IncomingMessage, MessageSource, OutgoingMessage, Producer } from '../src/kafka/bus.js';
+import { processMessage, RETRY_DELAYS_MS, superviseConsumer } from '../src/kafka/consumer.js';
+import { chunkBySize, MAX_SEND_BYTES, messageBytes, relayOnce, startRelay } from '../src/kafka/relay.js';
 import { cleanup, scheduleMaintenance } from '../src/maint.js';
 import { createSnapshotFetcher, SchoolUnavailableError } from '../src/school-client.js';
 import { handleSolveStatus } from '../src/domain/jobs.js';
@@ -24,14 +25,20 @@ afterAll(async () => {
   await Promise.all([relay.destroy(), maint.destroy(), su.destroy()]);
 });
 
+/** Kafka в пам'яті: failNext — наступна відправка падає; failOn — падає n-та відправка; понад 1 МБ — MESSAGE_TOO_LARGE. */
 class MemoryProducer implements Producer {
   sent: OutgoingMessage[] = [];
+  readonly calls: OutgoingMessage[][] = [];
   failNext = 0;
+  failOn = 0;
   async send(messages: OutgoingMessage[]) {
-    if (this.failNext > 0) {
-      this.failNext--;
+    this.calls.push(messages);
+    if (this.failNext > 0 || this.calls.length === this.failOn) {
+      if (this.failNext > 0) this.failNext--;
       throw new Error('kafka недоступна');
     }
+    // Як брокер з message.max.bytes ≈ 1 МБ: завеликий запит не приймається.
+    if (messages.reduce((n, m) => n + messageBytes(m), 0) > 1_048_576) throw new Error('MESSAGE_TOO_LARGE');
     this.sent.push(...messages);
   }
   async close() {}
@@ -46,6 +53,50 @@ describe('доступ', () => {
     expect((await get(await ctx.tokens.sysadmin())).statusCode).toBe(403);
     expect((await get(await ctx.tokens.sign({ realm_access: { roles: ['scheduler'] } }))).statusCode).toBe(403);
     expect((await get(await ctx.tokens.scheduler(uuid()))).statusCode).toBe(200);
+  });
+
+  test('прострочений, чужий iss, чужий azp, чужий ключ, без Bearer → 401 (Z4-3)', async () => {
+    const claims = { school_id: uuid(), realm_access: { roles: ['scheduler'] } };
+    const { privateKey } = await generateKeyPair('RS256');
+    const tokens = [
+      await ctx.tokens.sign(claims, { expiresIn: Math.floor(Date.now() / 1000) - 60 }),
+      await ctx.tokens.sign(claims, { issuer: 'http://evil/idp/realms/lad' }),
+      await ctx.tokens.sign({ ...claims, azp: 'tenant-service' }),
+      await ctx.tokens.sign(claims, { key: privateKey }),
+    ];
+    for (const t of tokens) {
+      const res = await get(t);
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toMatchObject({ code: 'unauthorized' });
+    }
+    const basic = await ctx.app.inject({ method: 'GET', url: '/api/v1/timetable/timetables', headers: { authorization: 'Basic abc' } });
+    expect(basic.statusCode).toBe(401);
+  });
+
+  test('без токена з некоректним тілом → 401, а не 400 зі схемою (Z4-7)', async () => {
+    const res = await ctx.app.inject({ method: 'PUT', url: '/api/v1/timetable/alert-hours/2026-11-08', payload: { minutes: 'x', bogus: 1 } });
+    expect(res.statusCode).toBe(401);
+    expect(res.body).not.toContain('minutes');
+    const publish = await ctx.app.inject({ method: 'POST', url: `/api/v1/timetable/timetables/${uuid()}:publish`, payload: {} });
+    expect(publish.statusCode).toBe(401);
+  });
+
+  test('X-Request-Id: короткий безпечний — у correlation_id події, довгий чи дивний — замінено uuid (Z3-9)', async () => {
+    const build = async (requestId: string) => {
+      const { id } = ctx.newSchool();
+      const res = await ctx.app.inject({
+        method: 'POST',
+        url: '/api/v1/timetable/timetables:build',
+        headers: { authorization: `Bearer ${await ctx.tokens.scheduler(id)}`, 'x-request-id': requestId },
+      });
+      expect(res.statusCode).toBe(202);
+      return (await ctx.events(id, 'solve.build.requested'))[0]!.correlation_id;
+    };
+    expect(await build('req-5f2c9a')).toBe('req-5f2c9a');
+    for (const bad of ['x'.repeat(200), 'a b', 'кирилиця']) {
+      const id = await build(bad);
+      expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    }
   });
 
   test('публічний маршрут без JWT, але кабінетні — ні; /internal на публічному порту → 404', async () => {
@@ -107,7 +158,7 @@ describe('консюмер', () => {
         backoffMs: () => 1,
       }),
     ).toBe('dlq');
-    expect(calls).toBe(3);
+    expect(calls).toBe(4);
     expect(producer.sent.map((m) => [m.topic, m.headers?.['x-original-offset']])).toEqual([
       ['solve.status.dlq', '7'],
       ['solve.status.dlq', '7'],
@@ -115,7 +166,104 @@ describe('консюмер', () => {
   });
 });
 
+describe('консюмер під наглядом', () => {
+  test('superviseConsumer: упалий потік (Kafka недоступна) перезапускається з паузою, процес живе (Z6-2)', async () => {
+    const producer = new MemoryProducer();
+    let made = 0;
+    let closed = 0;
+    const seen: string[] = [];
+    const source = (): MessageSource => {
+      const n = ++made;
+      let release: () => void = () => undefined;
+      const closedSignal = new Promise<void>((r) => (release = r));
+      return {
+        run: async (on) => {
+          if (n <= 2) throw new Error('joinGroup failed');
+          const value = JSON.stringify(ctx.status(uuid(), 'solve.started', { job_id: uuid() }));
+          await on({ topic: 't', partition: 0, offset: '1', key: null, value, commit: async () => { seen.push('commit'); } });
+          await closedSignal; // далі потік чекає нових повідомлень, поки його не закриють
+        },
+        close: async () => {
+          closed++;
+          release();
+        },
+      };
+    };
+    const handle = superviseConsumer(source, { db: ctx.db, producer, handlers: { t: async () => { seen.push('handled'); } }, log: silentLog }, { minDelayMs: 1, maxDelayMs: 5 });
+    for (let i = 0; i < 100 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(made).toBe(3);
+    expect(closed).toBe(2);
+    expect(seen).toEqual(['handled', 'commit']);
+    await handle.stop();
+    expect(closed).toBe(3);
+  });
+
+  test('технічна помилка: 4 спроби з паузами 1, 5, 15 с за замовчуванням (Z6-3)', () => {
+    expect(RETRY_DELAYS_MS).toEqual([1_000, 5_000, 15_000]);
+  });
+});
+
 describe('relay і чистка', () => {
+  /** Подія з корисним навантаженням ~bytes байтів прямо в outbox (як великі версії розкладу). */
+  async function bigEvent(schoolId: string, bytes: number) {
+    const eventId = crypto.randomUUID();
+    await su
+      .insertInto('outbox')
+      .values({ school_id: schoolId, event_id: eventId, topic: 'audit.recorded', payload: JSON.stringify({ event_id: eventId, pad: 'x'.repeat(bytes) }) })
+      .execute();
+    return eventId;
+  }
+  const isPublished = async (eventId: string) =>
+    (await su.selectFrom('outbox').select('published_at').where('event_id', '=', eventId).executeTakeFirstOrThrow()).published_at !== null;
+
+  test('пачка великих подій іде частинами до MAX_SEND_BYTES, а не одним запитом понад 1 МБ', async () => {
+    while ((await relayOnce(relay, new MemoryProducer())) > 0);
+    const school = crypto.randomUUID();
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) ids.push(await bigEvent(school, 250_000));
+    const producer = new MemoryProducer();
+    expect(await relayOnce(relay, producer)).toBe(10);
+    expect(producer.calls.length).toBeGreaterThanOrEqual(3);
+    for (const call of producer.calls) expect(call.reduce((n, m) => n + messageBytes(m), 0)).toBeLessThanOrEqual(MAX_SEND_BYTES);
+    for (const id of ids) expect(await isPublished(id)).toBe(true);
+  });
+
+  test('подія понад ліміт не блокує наступні: лишається ненадісланою, решта йде, onOversize викликано', async () => {
+    while ((await relayOnce(relay, new MemoryProducer())) > 0);
+    const school = crypto.randomUUID();
+    const huge = await bigEvent(school, 2_000_000);
+    const small = await bigEvent(school, 100);
+    const producer = new MemoryProducer();
+    const onOversize = vi.fn();
+    expect(await relayOnce(relay, producer, { onOversize })).toBe(1);
+    expect(await isPublished(small)).toBe(true);
+    expect(await isPublished(huge)).toBe(false);
+    expect(onOversize).toHaveBeenCalledWith(expect.objectContaining({ event_id: huge, school_id: school }));
+    // Прибираємо, щоб завелика подія не заважала іншим тестам файлу.
+    await su.deleteFrom('outbox').where('event_id', '=', huge).execute();
+  });
+
+  test('впала не перша частина — надіслані частини зафіксовано, решта йде наступним проходом', async () => {
+    while ((await relayOnce(relay, new MemoryProducer())) > 0);
+    const school = crypto.randomUUID();
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) ids.push(await bigEvent(school, 250_000));
+    const producer = new MemoryProducer();
+    producer.failOn = 2;
+    const first = await relayOnce(relay, producer);
+    expect(first).toBeGreaterThan(0);
+    expect(first).toBeLessThan(6);
+    expect(await relayOnce(relay, producer)).toBe(6 - first);
+    for (const id of ids) expect(await isPublished(id)).toBe(true);
+    expect(producer.sent).toHaveLength(6);
+    expect(new Set(producer.sent.map((m) => JSON.parse(m.value).event_id))).toEqual(new Set(ids));
+  });
+
+  test('chunkBySize: порядок збережено, межа не перевищується, завеликий елемент — окремою частиною', () => {
+    expect(chunkBySize([3, 3, 3, 9, 1], (n) => n, 6)).toEqual([[3, 3], [3], [9], [1]]);
+    expect(chunkBySize([], (n: number) => n, 6)).toEqual([]);
+  });
+
   test('relay відправляє outbox з ключем school_id; Kafka не прийняла — рядки лишаються', async () => {
     while ((await relayOnce(relay, new MemoryProducer())) > 0);
     const { id } = ctx.newSchool();

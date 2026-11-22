@@ -36,10 +36,12 @@ const UUID_RE = new RegExp(UUID);
 const DATE = '^\\d{4}-\\d{2}-\\d{2}$';
 const TIME = '^([01]\\d|2[0-3]):[0-5]\\d$';
 
+// Реквізити наказу зберігаються після trim(): рядок лише з пробілів — 400, а не наказ без номера (Z5-5, Z2-2).
+const NOT_BLANK = '\\S';
 const Order = {
-  order_no: Type.String({ minLength: 1, maxLength: 100 }),
+  order_no: Type.String({ minLength: 1, maxLength: 100, pattern: NOT_BLANK }),
   order_date: Type.String({ pattern: DATE }),
-  approved_by: Type.String({ minLength: 1, maxLength: 200 }),
+  approved_by: Type.String({ minLength: 1, maxLength: 200, pattern: NOT_BLANK }),
 };
 const PublishBody = Type.Object({ ...Order, effective_from: Type.String({ pattern: DATE }) }, { additionalProperties: false });
 const OrderBody = Type.Object(Order, { additionalProperties: false });
@@ -104,11 +106,21 @@ function body<T extends TSchema>(schema: T, value: unknown): Type.Static<T> {
   return (value ?? {}) as Type.Static<T>;
 }
 
+const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/** id запиту: X-Request-Id, якщо це 1..128 символів [A-Za-z0-9._:-], інакше новий uuid. */
+export function requestIdOf(request: { headers: Record<string, string | string[] | undefined> }): string {
+  const h = request.headers['x-request-id'];
+  return typeof h === 'string' && REQUEST_ID.test(h) ? h : randomUUID();
+}
+
 export function buildApp(deps: AppDeps): FastifyInstance {
   const app = Fastify({
     logger: deps.logger ?? { level: process.env.LOG_LEVEL ?? 'info', redact: LOG_REDACT },
-    requestIdHeader: 'x-request-id',
-    genReqId: () => randomUUID(),
+    // X-Request-Id від клієнта йде в correlation_id подій (envelope.v1: 1..128 символів): приймаємо
+    // лише короткий безпечний id, інакше — свій uuid (Z3-9).
+    requestIdHeader: false,
+    genReqId: requestIdOf,
     ajv: { customOptions: { removeAdditional: false, coerceTypes: false } },
   }).withTypeProvider<TypeBoxTypeProvider>();
 
@@ -139,7 +151,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   // ───────────── кабінет укладача ─────────────
   app.register(
     async (r) => {
-      r.addHook('preHandler', requireScheduler(deps.verifyToken));
+      // onRequest — до розбору й перевірки тіла: анонім отримує 401, а не 400 зі схемою маршруту (Z4-7).
+      r.addHook('onRequest', requireScheduler(deps.verifyToken));
       const t = r.withTypeProvider<TypeBoxTypeProvider>();
       const accepted = (reply: FastifyReply, payload: unknown) => reply.code(202).send(payload);
 

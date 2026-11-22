@@ -280,6 +280,16 @@ const migrations: Record<string, Migration> = {
       for (const table of [...TABLES].reverse()) await sql`drop table ${sql.raw(table)}`.execute(db);
     },
   },
+  // Назва цілі QR на момент останньої синхронізації зі знімком: запасна назва сторінки за QR, коли
+  // клас чи вчителя додали після останньої побудови й у копіях назв версій їх ще немає (Z5-9).
+  '0002_access_token_labels': {
+    async up(db: Kysely<unknown>) {
+      await sql`alter table access_tokens add column target_label text check (char_length(target_label) <= 200)`.execute(db);
+    },
+    async down(db: Kysely<unknown>) {
+      await sql`alter table access_tokens drop column target_label`.execute(db);
+    },
+  },
 };
 
 const provider: MigrationProvider = { getMigrations: async () => migrations };
