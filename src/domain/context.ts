@@ -11,6 +11,8 @@ export interface Deps {
   qrSecret: string;
   publicUrl: string;
   now: () => Date;
+  /** Лог фонової обробки подій (задає server.ts; у тестах може бути відсутній). */
+  log?: { warn(obj: object, msg: string): void };
 }
 
 export interface Ctx {

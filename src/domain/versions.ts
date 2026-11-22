@@ -3,7 +3,7 @@
 import type { LoadReport, Snapshot } from '@lad/validator-lib';
 import { ensureSchoolState, withSchool, type Trx } from '../db/index.js';
 import { fail } from '../problem.js';
-import { addDays, isSchoolDay, isValidDate, todayKyiv } from '../time.js';
+import { addDays, firstSchoolDayFrom, isSchoolDay, isValidDate, todayKyiv } from '../time.js';
 import { recordAudit, type Ctx, type Deps } from './context.js';
 import { hasCurrentOrFutureActivation, syncSchoolState } from './jobs.js';
 import { missingProfileFields, project, type Names } from './projection.js';
@@ -179,7 +179,9 @@ export async function publishVersion(deps: Deps, ctx: Ctx, timetableId: string, 
   const fresh = await deps.fetchSnapshot(ctx.schoolId, ctx.correlationId);
   const now = deps.now();
   const today = todayKyiv(now);
-  const earliest = addDays(today, deps.policy.publishMinDays);
+  // Підказка earliest — перший навчальний день не раніше сьогодні + PUBLISH_MIN_DAYS, щоб публікація на
+  // неї не давала одразу not_school_day (#4).
+  const earliest = firstSchoolDayFrom(addDays(today, deps.policy.publishMinDays), fresh.profile.saturday);
   if (body.effective_from < earliest) {
     fail(422, 'effective_from_too_early', 'Зарано', `Розклад може діяти не раніше ${earliest} (через ${deps.policy.publishMinDays} днів)`, {
       earliest,

@@ -50,6 +50,13 @@ export const schoolDays = (saturday: boolean): number[] => (saturday ? [1, 2, 3,
 
 export const isSchoolDay = (date: string, saturday: boolean): boolean => schoolDays(saturday).includes(isoWeekday(date));
 
+/** Перший навчальний день не раніше за date (з урахуванням суботи закладу). */
+export function firstSchoolDayFrom(date: string, saturday: boolean): string {
+  let d = date;
+  while (!isSchoolDay(d, saturday)) d = addDays(d, 1);
+  return d;
+}
+
 /** Дні між from і to включно. */
 export function datesBetween(from: string, to: string): string[] {
   const out: string[] = [];

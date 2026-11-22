@@ -11,6 +11,7 @@ import type { Ctx, Deps } from './context.js';
 import { isTerminal, onCompleted, onStarted, SOLVE_STATUSES, type SolveStatus } from './job-state.js';
 import { missingProfileFields, precheck, project, type Kind, type Names } from './projection.js';
 import { check, conflictsOf, insertVersion, type TimetableData } from './store.js';
+import { contractError } from '../contracts.js';
 import { completeSubstitution } from './substitutions.js';
 
 export interface JobView {
@@ -227,10 +228,19 @@ export async function handleSolveStatus(deps: Deps, e: Envelope): Promise<'proce
   if (e.type === 'solve.completed' && (!status || !SOLVE_STATUSES.includes(status))) {
     throw new InvalidEventError(`solve.completed з невідомим статусом ${String(status)}`);
   }
+  // Подія не за схемою contracts — помилка solver, а не результат (#2): задача одразу failed
+  // invalid_event, а не чекає сторожа і не дає мовчазних замін.
+  const invalid = contractError('solve.status', e);
   return withSchool(deps.db, e.school_id, async (trx) => {
     if (!(await claimInbox(trx, e.school_id, e.event_id, 'solve.status'))) return 'duplicate';
     const job = await trx.selectFrom('jobs').selectAll().where('job_id', '=', jobId).forUpdate().executeTakeFirst();
     if (!job) return 'ignored';
+    if (invalid) {
+      if (isTerminal(job.state)) return 'ignored';
+      await finish(trx, job.job_id, 'failed', { error: 'invalid_event' });
+      deps.log?.warn({ job_id: job.job_id, school_id: e.school_id, event_id: e.event_id, reason: invalid }, 'solve.status не за схемою contracts');
+      return 'processed';
+    }
     if (e.type === 'solve.started') {
       const d = onStarted(job, startedAt, deps.policy.runDeadlineMarginS);
       if (!d.accept) return 'ignored';

@@ -1,7 +1,7 @@
 // Побудова (:build), задачі й solve.status, сторож, версії, /load, :publish (409 stale), :copy, PATCH.
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { handleSolveStatus, runWatchdog } from '../src/domain/jobs.js';
-import { contractsValidator, maintDb, ORDER, PUBLISH_FROM, testApp, uuid, type TestCtx } from './helpers.js';
+import { contractsValidator, maintDb, ORDER, PUBLISH_FROM, solve, testApp, uuid, type TestCtx } from './helpers.js';
 import type { Db } from '../src/db/index.js';
 
 let ctx: TestCtx;
@@ -164,6 +164,26 @@ describe('solve.status', () => {
     await expect(handleSolveStatus(ctx.deps, { ...ctx.status(id, 'solve.started', { job_id: uuid() }), type: 'solve.paused' })).rejects.toThrow(/тип/);
     await expect(handleSolveStatus(ctx.deps, ctx.status(id, 'solve.started', { job_id: uuid(), started_at: 'вчора' }))).rejects.toThrow(/started_at/);
   });
+
+  test('solve.status не за схемою contracts → задача failed invalid_event; нове поле новішого MINOR не заважає (#2)', async () => {
+    const { id } = ctx.newSchool();
+    const jobId = (await ctx.as(id, 'POST', '/timetables:build')).json().job_id;
+    // Немає обов'язкових lessons і day_formats.
+    expect(await handleSolveStatus(ctx.deps, ctx.status(id, 'solve.completed', { job_id: jobId, status: 'FEASIBLE', conflicts: [] }))).toBe('processed');
+    expect((await ctx.as(id, 'GET', `/jobs/${jobId}`)).json()).toMatchObject({ state: 'failed', error: 'invalid_event' });
+
+    const { id: other } = ctx.newSchool();
+    const { jobId: ok, req } = await (async () => {
+      const r = await ctx.as(other, 'POST', '/timetables:build');
+      const j = r.json().job_id as string;
+      return { jobId: j, req: (await ctx.events(other, 'solve.build.requested')).map((e) => e.data).find((d) => d.job_id === j)! };
+    })();
+    const result = solve(req as never);
+    const event = ctx.status(other, 'solve.completed', { job_id: ok, status: 'FEASIBLE', ...result, conflicts: [], future_field: { from: '0.6.0' } });
+    expect(contractsValidator()('solve.status.v1.json')(event)).toBe(false);
+    await handleSolveStatus(ctx.deps, event);
+    expect((await ctx.as(other, 'GET', `/jobs/${ok}`)).json().state).toBe('done');
+  });
 });
 
 describe('сторож', () => {
@@ -227,6 +247,31 @@ describe(':publish', () => {
       const res = await ctx.as(id, 'POST', url, { ...ORDER, effective_from: PUBLISH_FROM, ...blank });
       expect(res.statusCode, JSON.stringify(blank)).toBe(400);
       expect(res.json()).toMatchObject({ code: 'validation_failed' });
+    }
+  });
+
+  test('earliest у 422 — навчальний день: неділя → понеділок; субота — лише для закладу із суботою (#4)', async () => {
+    const at = async (now: string, saturday: boolean) => {
+      ctx.clock.now = new Date('2026-11-09T10:00:00Z');
+      const { id } = ctx.newSchool({ saturday });
+      const { job } = await ctx.build(id);
+      ctx.clock.now = new Date(now);
+      const url = `/timetables/${job.result.timetable_id}:publish`;
+      const res = (await ctx.as(id, 'POST', url, { ...ORDER, effective_from: '2026-11-17' })).json();
+      expect(res).toMatchObject({ code: 'effective_from_too_early' });
+      // Публікація на підказану дату не впирається в not_school_day.
+      expect((await ctx.as(id, 'POST', url, { ...ORDER, effective_from: res.earliest })).statusCode).toBe(200);
+      return res.earliest as string;
+    };
+    try {
+      // Неділя 15.11 (Київ) + 7 днів = неділя 22.11.
+      expect(await at('2026-11-15T10:00:00Z', false)).toBe('2026-11-23');
+      expect(await at('2026-11-15T10:00:00Z', true)).toBe('2026-11-23');
+      // Субота 14.11 + 7 днів = субота 21.11.
+      expect(await at('2026-11-14T10:00:00Z', false)).toBe('2026-11-23');
+      expect(await at('2026-11-14T10:00:00Z', true)).toBe('2026-11-21');
+    } finally {
+      ctx.clock.now = new Date('2026-11-09T10:00:00Z');
     }
   });
 
