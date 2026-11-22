@@ -23,12 +23,17 @@ export const QR_SECRET = 'test-qr-secret-0123456789abcdef0123456789';
 export const NOW = new Date('2026-11-09T10:00:00Z');
 export const silentLog = Fastify({ logger: { level: 'silent' } }).log;
 
+type PrivateKey = Awaited<ReturnType<typeof generateKeyPair>>['privateKey'];
+
 export async function createTestTokens() {
   const { privateKey, publicKey } = await generateKeyPair('RS256');
   const jwk = { ...(await exportJWK(publicKey)), kid: 'test', alg: 'RS256' };
   const verifyToken = createTokenVerifier({ issuer: ISSUER, clientId: 'web', keys: createLocalJWKSet({ keys: [jwk] }) });
-  const sign = (claims: Record<string, unknown>) =>
-    new SignJWT({ azp: 'web', ...claims }).setProtectedHeader({ alg: 'RS256', kid: 'test' }).setIssuer(ISSUER).setSubject('user-1').setIssuedAt().setExpirationTime('15m').sign(privateKey);
+  const sign = (
+    claims: Record<string, unknown>,
+    { issuer = ISSUER, expiresIn = '15m', key = privateKey }: { issuer?: string; expiresIn?: string | number; key?: PrivateKey } = {},
+  ) =>
+    new SignJWT({ azp: 'web', ...claims }).setProtectedHeader({ alg: 'RS256', kid: 'test' }).setIssuer(issuer).setSubject('user-1').setIssuedAt().setExpirationTime(expiresIn).sign(key);
   return {
     verifyToken,
     sign,

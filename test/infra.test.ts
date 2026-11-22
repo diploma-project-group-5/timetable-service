@@ -1,4 +1,5 @@
 // Доступ (JWT), консюмер (3 спроби → DLQ), relay, чистка, клієнт знімка school-service.
+import { generateKeyPair } from 'jose';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import type { Db } from '../src/db/index.js';
 import type { IncomingMessage, MessageSource, OutgoingMessage, Producer } from '../src/kafka/bus.js';
@@ -52,6 +53,50 @@ describe('доступ', () => {
     expect((await get(await ctx.tokens.sysadmin())).statusCode).toBe(403);
     expect((await get(await ctx.tokens.sign({ realm_access: { roles: ['scheduler'] } }))).statusCode).toBe(403);
     expect((await get(await ctx.tokens.scheduler(uuid()))).statusCode).toBe(200);
+  });
+
+  test('прострочений, чужий iss, чужий azp, чужий ключ, без Bearer → 401 (Z4-3)', async () => {
+    const claims = { school_id: uuid(), realm_access: { roles: ['scheduler'] } };
+    const { privateKey } = await generateKeyPair('RS256');
+    const tokens = [
+      await ctx.tokens.sign(claims, { expiresIn: Math.floor(Date.now() / 1000) - 60 }),
+      await ctx.tokens.sign(claims, { issuer: 'http://evil/idp/realms/lad' }),
+      await ctx.tokens.sign({ ...claims, azp: 'tenant-service' }),
+      await ctx.tokens.sign(claims, { key: privateKey }),
+    ];
+    for (const t of tokens) {
+      const res = await get(t);
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toMatchObject({ code: 'unauthorized' });
+    }
+    const basic = await ctx.app.inject({ method: 'GET', url: '/api/v1/timetable/timetables', headers: { authorization: 'Basic abc' } });
+    expect(basic.statusCode).toBe(401);
+  });
+
+  test('без токена з некоректним тілом → 401, а не 400 зі схемою (Z4-7)', async () => {
+    const res = await ctx.app.inject({ method: 'PUT', url: '/api/v1/timetable/alert-hours/2026-11-08', payload: { minutes: 'x', bogus: 1 } });
+    expect(res.statusCode).toBe(401);
+    expect(res.body).not.toContain('minutes');
+    const publish = await ctx.app.inject({ method: 'POST', url: `/api/v1/timetable/timetables/${uuid()}:publish`, payload: {} });
+    expect(publish.statusCode).toBe(401);
+  });
+
+  test('X-Request-Id: короткий безпечний — у correlation_id події, довгий чи дивний — замінено uuid (Z3-9)', async () => {
+    const build = async (requestId: string) => {
+      const { id } = ctx.newSchool();
+      const res = await ctx.app.inject({
+        method: 'POST',
+        url: '/api/v1/timetable/timetables:build',
+        headers: { authorization: `Bearer ${await ctx.tokens.scheduler(id)}`, 'x-request-id': requestId },
+      });
+      expect(res.statusCode).toBe(202);
+      return (await ctx.events(id, 'solve.build.requested'))[0]!.correlation_id;
+    };
+    expect(await build('req-5f2c9a')).toBe('req-5f2c9a');
+    for (const bad of ['x'.repeat(200), 'a b', 'кирилиця']) {
+      const id = await build(bad);
+      expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    }
   });
 
   test('публічний маршрут без JWT, але кабінетні — ні; /internal на публічному порту → 404', async () => {

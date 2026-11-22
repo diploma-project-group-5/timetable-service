@@ -6,7 +6,7 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 
 ## API кабінету `/api/v1/timetable/*`
 
-Лише токен клієнта `web` з роллю `scheduler` і `school_id`; заклад — з токена. 401 / 403 / 404 як у school-service. Помилки — `application/problem+json` з `code`, для порушень правил — `conflicts[]` у формі `contracts/schemas/events/conflict.v1.json`. Дії — через двокрапку.
+Лише токен клієнта `web` з роллю `scheduler` і `school_id`; заклад — з токена. 401 / 403 / 404 як у school-service; токен перевіряється до розбору тіла (`onRequest`). `X-Request-Id` (1–128 символів `[A-Za-z0-9._:-]`) стає `correlation_id` подій, інший замінюється uuid. Помилки — `application/problem+json` з `code`, для порушень правил — `conflicts[]` у формі `contracts/schemas/events/conflict.v1.json`. Дії — через двокрапку.
 
 ### Задачі й версії
 
