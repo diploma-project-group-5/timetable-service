@@ -19,6 +19,7 @@ export type ProblemCode =
   | 'alert_plan_missing'
   | 'alert_plan_not_approved'
   | 'activation_overlap'
+  | 'activation_ended'
   | 'invalid_date'
   | 'no_timetable'
   | 'teacher_not_found'

@@ -30,7 +30,7 @@ Node 24 · TypeScript 6.0 · Fastify 5 · Kysely + PostgreSQL 16 (btree_gist) ·
 | `GET` `PUT /alert-plan/bells` | дзвінки тривог № 1..N без пропусків; PUT повертає план у draft; 409, поки є чинна чи майбутня активація |
 | `POST /alert-plan:approve` | `{order_no, order_date, approved_by}` (не з одних пробілів, інакше 400); 409 `build_in_progress` / `alert_plan_missing` |
 | `POST /alert-plan:activate` | `{from}` — навчальна дата не раніше сьогодні; 409 `alert_plan_not_approved` / `stale` / `activation_overlap` / `build_in_progress`; `warnings.lost_substitutions[]` |
-| `POST /alert-plan/activations/{id}:end` | `{from}` — дата повернення (пізніша за початок, не раніше сьогодні); ще не чинна активація скасовується; `warnings.lost_substitutions[]` |
+| `POST /alert-plan/activations/{id}:end` | `{from}` — дата повернення (пізніша за початок, не раніше сьогодні, інакше 422) і для активації, що ще не почалась; повтор з тією ж датою — та сама відповідь без нового запису в журналі; завершена — 409 `activation_ended`; `warnings.lost_substitutions[]` |
 | `GET /alert-hours?from=&to=` | тривалість тривог по днях, `current_streak_days`, `recommendation`, пороги `threshold_minutes`, `threshold_days` |
 | `PUT /alert-hours/{date}` | `{minutes}` (0–1440) за минулий день або сьогодні |
 

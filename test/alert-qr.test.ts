@@ -84,21 +84,34 @@ describe('розклад тривог', () => {
     expect((await ctx.as(id, 'PUT', '/alert-plan/bells', ALERT_BELLS)).json()).toMatchObject({ code: 'alert_plan_active' });
     expect((await ctx.as(id, 'PATCH', `/timetables/${tt}/lessons/${uuid()}/1/1`, { day: 1, lesson_no: 2 })).json()).toMatchObject({ code: 'alert_plan_active' });
 
-    // Активація ще не почалась (сьогодні 09.11, з 10.11) — :end її скасовує.
-    const cancel = await ctx.as(id, 'POST', `/alert-plan/activations/${activationId}:end`, { from: '2026-11-11' });
-    expect(cancel.json()).toMatchObject({ cancelled: true });
-    expect((await ctx.as(id, 'GET', '/alert-plan')).json().activations).toEqual([]);
+    // Активація ще не почалась (сьогодні 09.11, з 10.11): дата повернення перевіряється так само (Z2-4).
+    const end = (activation: string, from: string) => ctx.as(id, 'POST', `/alert-plan/activations/${activation}:end`, { from });
+    expect((await end(activationId, '2020-01-01')).json()).toMatchObject({ code: 'invalid_date' });
+    expect((await end(activationId, '2026-11-10')).json()).toMatchObject({ code: 'invalid_date' });
+    const short = await end(activationId, '2026-11-11');
+    expect(short.json()).toEqual({ activation_id: activationId, warnings: { lost_substitutions: [] } });
+    expect((await ctx.as(id, 'GET', '/alert-plan')).json().activations).toEqual([{ activation_id: activationId, from: '2026-11-10', to: '2026-11-11' }]);
 
-    const now = await ctx.as(id, 'POST', '/alert-plan:activate', { from: '2026-11-09' });
-    const current = now.json().activation_id;
-    expect((await ctx.as(id, 'POST', `/alert-plan/activations/${current}:end`, { from: '2026-11-09' })).json()).toMatchObject({ code: 'invalid_date' });
-    const ended = await ctx.as(id, 'POST', `/alert-plan/activations/${current}:end`, { from: '2026-11-12' });
-    expect(ended.json()).toMatchObject({ cancelled: false, warnings: { lost_substitutions: [] } });
-    expect((await ctx.as(id, 'GET', '/alert-plan')).json().activations).toEqual([{ activation_id: current, from: '2026-11-09', to: '2026-11-12' }]);
-    expect((await ctx.as(id, 'POST', `/alert-plan/activations/${uuid()}:end`, { from: '2026-11-12' })).statusCode).toBe(404);
+    const next = await ctx.as(id, 'POST', '/alert-plan:activate', { from: '2026-11-11' });
+    const current = next.json().activation_id;
+    expect((await end(current, '2026-11-11')).json()).toMatchObject({ code: 'invalid_date' });
+    expect((await end(current, '2026-11-12')).json()).toMatchObject({ warnings: { lost_substitutions: [] } });
+    // Повтор (подвійний клік) — та сама відповідь, без другого запису в журналі (Z5-15).
+    expect((await end(current, '2026-11-12')).statusCode).toBe(200);
+    expect((await ctx.as(id, 'GET', '/alert-plan')).json().activations).toEqual([
+      { activation_id: activationId, from: '2026-11-10', to: '2026-11-11' },
+      { activation_id: current, from: '2026-11-11', to: '2026-11-12' },
+    ]);
+    expect((await end(uuid(), '2026-11-12')).statusCode).toBe(404);
+    ctx.clock.now = new Date('2026-11-13T10:00:00Z');
+    try {
+      expect((await end(current, '2026-11-16')).json()).toMatchObject({ code: 'activation_ended' });
+    } finally {
+      ctx.clock.now = new Date('2026-11-09T10:00:00Z');
+    }
 
     const actions = (await ctx.events(id, 'audit.recorded')).map((e) => e.data.action);
-    expect(actions).toEqual(['alert_plan_approved', 'alert_plan_activated', 'alert_plan_activation_cancelled', 'alert_plan_activated', 'alert_plan_ended']);
+    expect(actions).toEqual(['alert_plan_approved', 'alert_plan_activated', 'alert_plan_ended', 'alert_plan_activated', 'alert_plan_ended']);
   });
 
   test(':activate на змінених даних, що порушують ліміт 1.2 → 409 stale з умовою', async () => {

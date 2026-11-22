@@ -350,6 +350,35 @@ describe('пропозиції й погодження', () => {
   });
 });
 
+describe('публікація і заміни', () => {
+  test('нова публікація замість запланованої: заміни запланованої версії → warnings.lost_substitutions (Z2-3)', async () => {
+    ctx.clock.now = new Date('2026-11-09T10:00:00Z');
+    const s = ctx.newSchool();
+    const a = (await ctx.build(s.id)).job.result.timetable_id;
+    await ctx.as(s.id, 'POST', `/timetables/${a}:publish`, { ...ORDER, effective_from: '2026-11-16' });
+    const [t1, t2] = s.snap.teachers.map((t) => t.teacher_id);
+    const c1 = s.snap.classes[0]!.class_id;
+    const jobId = (await absent(s.id, { teacher_id: t1, date_from: '2026-11-17', date_to: '2026-11-17' })).job_ids[0]!;
+    await complete(s.id, jobId, [{ class_id: c1, lesson_no: 1, kind: 'teacher', teacher_id: t2 }]);
+    expect((await ctx.as(s.id, 'POST', `/substitutions/${jobId}:approve`, {})).statusCode).toBe(200);
+    const b = (await ctx.build(s.id)).job.result.timetable_id;
+    const res = await ctx.as(s.id, 'POST', `/timetables/${b}:publish`, { ...ORDER, effective_from: '2026-11-23' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().warnings.lost_substitutions).toEqual([{ date: '2026-11-17', class_id: c1, lesson_no: 1 }]);
+  });
+
+  test(':publish, коли обов\'язкове поле профілю обнулили після побудови → 422 profile_incomplete (Z5-2)', async () => {
+    ctx.clock.now = new Date('2026-11-09T10:00:00Z');
+    const s = ctx.newSchool();
+    const tt = (await ctx.build(s.id)).job.result.timetable_id;
+    s.snap.profile.shelter_capacity = null;
+    s.snap.snapshot_version = 6;
+    const res = await ctx.as(s.id, 'POST', `/timetables/${tt}:publish`, { ...ORDER, effective_from: '2026-11-16' });
+    expect(res.statusCode).toBe(422);
+    expect(res.json()).toMatchObject({ code: 'profile_incomplete', fields: ['shelter_capacity'] });
+  });
+});
+
 describe('експорт вчителя (етап 2)', () => {
   test('уроки у версіях, відсутності без причини, заміни; запис у журнал', async () => {
     const { id, t1: teacherId } = await liveSchool();

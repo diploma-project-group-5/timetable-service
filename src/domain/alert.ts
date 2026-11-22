@@ -134,7 +134,9 @@ export async function activateAlertPlan(deps: Deps, ctx: Ctx, from: string) {
 
 /**
  * POST /alert-plan/activations/{id}:end {from}: з цієї дати знову діє основний розклад; дата пізніша
- * за початок активації і не раніше сьогодні (інакше 422). Ще не чинна активація — скасовується.
+ * за початок активації і не раніше сьогодні (інакше 422) — і для активації, що ще не почалась (раніше
+ * таку мовчки видаляли за будь-якої дати, Z2-4). Повтор з тією ж датою — та сама відповідь без
+ * нового запису в журналі (Z5-15); завершена активація — 409 activation_ended.
  */
 export async function endActivation(deps: Deps, ctx: Ctx, activationId: string, from: string) {
   if (!isValidDate(from)) fail(422, 'invalid_date', 'Некоректна дата', 'from: YYYY-MM-DD');
@@ -144,14 +146,8 @@ export async function endActivation(deps: Deps, ctx: Ctx, activationId: string, 
     await ensureSchoolState(trx, ctx.schoolId, true);
     const a = await trx.selectFrom('alert_activations').selectAll().where('activation_id', '=', activationId).executeTakeFirst();
     if (!a) return fail(404, 'not_found', 'Активацію не знайдено');
-    if (a.date_to !== null && a.date_to <= today) fail(409, 'validation_failed', 'Активація вже завершилась');
-    if (a.date_from > today) {
-      // Ще не почалась: скасування. Погоджені заміни на шаблоні тривог у її датах втрачають силу.
-      const lost = await approvedSubstitutionsOn(trx, { from: a.date_from, to: a.date_to, timetableKind: 'alert' });
-      await trx.deleteFrom('alert_activations').where('activation_id', '=', activationId).execute();
-      await recordAudit(trx, ctx, 'alert_plan_activation_cancelled', activationId, { from: a.date_from }, now);
-      return { activation_id: activationId, cancelled: true, warnings: { lost_substitutions: lost } };
-    }
+    if (a.date_to !== null && a.date_to === from) return { activation_id: activationId, warnings: { lost_substitutions: [] } };
+    if (a.date_to !== null && a.date_to <= today) fail(409, 'activation_ended', 'Активація вже завершилась', `Основний розклад діє з ${a.date_to}`);
     if (from < today || from <= a.date_from) {
       fail(422, 'invalid_date', 'Некоректна дата повернення', 'Дата повернення пізніша за початок активації і не раніше сьогодні');
     }
@@ -159,7 +155,7 @@ export async function endActivation(deps: Deps, ctx: Ctx, activationId: string, 
     const lost = await approvedSubstitutionsOn(trx, { from, to: a.date_to, timetableKind: 'alert' });
     await trx.updateTable('alert_activations').set({ date_to: from }).where('activation_id', '=', activationId).execute();
     await recordAudit(trx, ctx, 'alert_plan_ended', activationId, { from }, now);
-    return { activation_id: activationId, cancelled: false, warnings: { lost_substitutions: lost } };
+    return { activation_id: activationId, warnings: { lost_substitutions: lost } };
   });
 }
 

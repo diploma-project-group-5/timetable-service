@@ -6,7 +6,7 @@ import { fail } from '../problem.js';
 import { addDays, isSchoolDay, isValidDate, todayKyiv } from '../time.js';
 import { recordAudit, type Ctx, type Deps } from './context.js';
 import { hasCurrentOrFutureActivation, syncSchoolState } from './jobs.js';
-import { project, type Names } from './projection.js';
+import { missingProfileFields, project, type Names } from './projection.js';
 import { approvedSubstitutionsOn, loadCalendar, phaseOf, type LostSubstitution, type Phase } from './resolve.js';
 import { check, conflictsOf, insertVersion, readData, writeData, type TimetableData } from './store.js';
 
@@ -188,6 +188,9 @@ export async function publishVersion(deps: Deps, ctx: Ctx, timetableId: string, 
   if (!isSchoolDay(body.effective_from, fresh.profile.saturday)) {
     fail(422, 'not_school_day', 'Не навчальний день', 'effective_from має бути навчальним днем');
   }
+  // Профіль, у якому потім обнулили обов'язкове поле, не дає перевірити версію на свіжих даних (Z5-2).
+  const missing = missingProfileFields(fresh, 'main');
+  if (missing.length > 0) fail(422, 'profile_incomplete', 'Профіль закладу неповний', `Заповніть: ${missing.join(', ')}`, { fields: missing });
 
   return withSchool(deps.db, ctx.schoolId, async (trx) => {
     // Блокування рядка закладу: дві публікації одного закладу не перетнуться.
@@ -227,10 +230,23 @@ export async function publishVersion(deps: Deps, ctx: Ctx, timetableId: string, 
       .where('timetable_id', '=', timetableId)
       .execute();
 
-    // Заміни, пораховані для інших основних версій, з effective_from втрачають силу (крім дат активації тривог).
-    const lost = (await approvedSubstitutionsOn(trx, { from: body.effective_from, timetableKind: 'main', exceptTimetableId: timetableId })).filter(
-      (s) => !cal.activations.some((a) => a.date_from <= s.date && (a.date_to === null || s.date < a.date_to)),
-    );
+    // Втрачають силу (крім дат активації тривог): заміни інших основних версій з effective_from і всі
+    // майбутні заміни запланованої версії, яку ця публікація повернула у validated (Z2-3).
+    const fromNew = await approvedSubstitutionsOn(trx, { from: body.effective_from, timetableKind: 'main', exceptTimetableId: timetableId });
+    const fromReplaced =
+      scheduled.length > 0
+        ? await trx
+            .selectFrom('substitutions')
+            .select(['date', 'class_id', 'lesson_no'])
+            .where('state', '=', 'approved')
+            .where('timetable_id', 'in', scheduled)
+            .where('date', '>=', today)
+            .where('date', '<', body.effective_from)
+            .execute()
+        : [];
+    const lost = [...fromReplaced, ...fromNew]
+      .filter((s) => !cal.activations.some((a) => a.date_from <= s.date && (a.date_to === null || s.date < a.date_to)))
+      .sort((a, b) => a.date.localeCompare(b.date) || a.class_id.localeCompare(b.class_id) || a.lesson_no - b.lesson_no);
     await recordAudit(trx, ctx, 'timetable_published', timetableId, {
       order_no: body.order_no.trim(),
       order_date: body.order_date,
