@@ -232,9 +232,13 @@ export async function testApp(opts: { policy?: Partial<Policy> } = {}) {
   }
 
   async function close() {
-    await app.close();
-    await db.destroy();
-    await relay.destroy();
+    try {
+      await checkOutgoingEvents(relay);
+    } finally {
+      await app.close();
+      await db.destroy();
+      await relay.destroy();
+    }
   }
 
   return { app, db, deps, tokens, logs, school, clock, as, events, status, build, newSchool: school_, close };
@@ -258,4 +262,29 @@ export function contractsValidator() {
 /** Каталог contracts (вектори, приклади). */
 export function contractsDir(): string {
   return dirname(createRequire(import.meta.url).resolve('@lad/contracts/package.json'));
+}
+
+/** Топіки, які публікує timetable, і їхні схеми в contracts. */
+const OUTGOING: Record<string, string> = {
+  'audit.recorded': 'audit.recorded.v1.json',
+  'solve.build.requested': 'solve.build.requested.v1.json',
+  'solve.substitution.requested': 'solve.substitution.requested.v1.json',
+};
+
+/**
+ * Кожна подія, яку сервіс поклав в outbox (source = timetable-service), відповідає схемі свого топіка
+ * в contracts. Викликається при закритті тестового застосунку, тож перевіряє все, що записав файл тестів,
+ * а не лише прочитані тестом події. Рядки, вставлені тестами напряму (без source), не перевіряються.
+ */
+async function checkOutgoingEvents(relay: Db): Promise<void> {
+  const schema = contractsValidator();
+  const rows = await relay.selectFrom('outbox').select(['topic', 'payload']).where('topic', 'in', Object.keys(OUTGOING)).execute();
+  const failures: string[] = [];
+  for (const r of rows) {
+    const event = (typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload) as Envelope;
+    if (event.source !== 'timetable-service') continue;
+    const validate = schema(OUTGOING[r.topic]!);
+    if (!validate(event)) failures.push(`${r.topic} ${JSON.stringify(event.data).slice(0, 200)}: ${JSON.stringify(validate.errors?.slice(0, 2))}`);
+  }
+  if (failures.length > 0) throw new Error(`Події не за схемами contracts (${failures.length}):\n${failures.slice(0, 5).join('\n')}`);
 }

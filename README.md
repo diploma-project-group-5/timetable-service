@@ -104,7 +104,7 @@ Outbox, inbox, relay (частинами до 900 КБ), консюмер (4 с�
 
 ## validator-lib
 
-Git-залежності `…validator-lib.git#v0.4.0` і `@lad/contracts#v0.5.0` (схеми для перевірки `solve.status` під час роботи). `validate` перевіряє результат побудови й версії, `dayLoad` рахує `/load`, `newConflicts` дає вердикт задачі заміни й `:approve`. Власних правил перевірки накладок у timetable немає.
+Git-залежності `…validator-lib.git#v0.4.1` і `@lad/contracts#v0.6.0` (схеми для перевірки `solve.status` під час роботи). `validate` перевіряє результат побудови й версії, `dayLoad` рахує `/load`, `newConflicts` дає вердикт задачі заміни й `:approve`. Власних правил перевірки накладок у timetable немає.
 
 ## Розбіжності з припущеннями у `frontend/src/api/types.ts`
 
@@ -138,6 +138,7 @@ Testcontainers піднімає PostgreSQL 16.15 і Kafka 4.3.2 (потрібе�
 | `test/alert-qr.test.ts` | розклад тривог (модель 1.2, погодження, активації, перетин, `alert_plan_locked`, stale за умовою seats), облік тривог, QR (HMAC, перевипуск, підробки), публічна сторінка (без підписів, тривоги, канікули), `school.data.changed` |
 | `test/substitutions.test.ts` | відсутності (payload проти схеми contracts 0.5.0, накладки й відсутності тижня, канікули, 409 `teacher_is_substitute`), результат solver (інваріант, вердикт validator-lib), погодження (`newConflicts`, 409 `date_passed`), сторінки за QR із замінами, `lost_substitutions`, експорт; події solver — з прикладу contracts і перевіряються схемою |
 | `test/units.test.ts` | машина станів проти `contracts/vectors/job-lifecycle`, `effectiveWeek` проти `contracts/vectors/substitution`, вердикт заміни проти `contracts/vectors/substitution-solve`, Europe/Kyiv (23:30/00:30, DST), токен QR, конфігурація |
+| `test/helpers.ts` | при закритті тестового застосунку кожна подія, яку timetable поклав в outbox (`audit.recorded`, `solve.build.requested`, `solve.substitution.requested`), перевіряється схемою contracts; інакше файл тестів падає |
 | `test/db.test.ts` | RLS, права app/relay/maint, FORCE, `school_id` у ключі, CHECK/EXCLUDE, міграції up/down |
 | `test/infra.test.ts` | доступ, консюмер і DLQ, relay, чистка, клієнт знімка |
 | `test/kafka.test.ts` | справжня Kafka: `solve.build.requested` у топіку, `solve.status` з топіка → `done`, DLQ |
